@@ -183,9 +183,18 @@ class KrakenEigenvalueIFT(torch.autograd.Function):
         grad_B1_delta[loc_end] += (grad_p2i_delta * g_bot).sum()
         grad_h2k2_delta += grad_p2i_delta * (-g_bot)
 
-        # dDelta/dx = interior via h2k2 + bdry
-        dDelta_dx = grad_h2k2_delta * h2 + (
-            f_interior.detach() * dgdx_top.detach() - g_interior.detach() * dfdx_top.detach()
+        # dDelta/dx = interior via h2k2 + top BC + bottom BC via recurrence ICs.
+        dp1_init_dx = -2.0 * dgdx_bot.detach()
+        dp2_init_dx = (
+            + (B1_end - h2k2) * dgdx_bot.detach()
+            - 2.0 * h_med * rho_med * dfdx_bot.detach()
+        )
+        dDelta_dx = (
+            grad_h2k2_delta * h2
+            + grad_p1i_delta * dp1_init_dx
+            + grad_p2i_delta * dp2_init_dx
+            + f_interior.detach() * dgdx_top.detach()
+            - g_interior.detach() * dfdx_top.detach()
         )
 
         ift_scale = -grad_x * _lorentz_inv(dDelta_dx, eps)

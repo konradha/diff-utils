@@ -35,6 +35,19 @@ def _eval_delta(x_val, B1, h, rho, loc_start, loc_end):
     return -g_val[0].item()
 
 
+def _eval_delta_bottom_bc(x_val, B1, h, rho, loc_start, loc_end, alpha, beta):
+    h2 = h * h
+    h2k2 = torch.tensor([h2 * x_val], dtype=torch.float64)
+    g_bot = torch.tensor([1.0 + beta * x_val], dtype=torch.float64)
+    f_bot = torch.tensor([alpha * x_val], dtype=torch.float64)
+    p1_init = -2.0 * g_bot
+    p2_init = (B1[loc_end] - h2k2) * g_bot - 2.0 * h * f_bot * rho
+    _, g_val, _ = AcousticRecurrenceFn.apply(
+        B1.detach(), h2k2, loc_start, loc_end, p1_init, p2_init
+    )
+    return -g_val[0].item()
+
+
 def _find_eigenvalue(B1, h, rho, loc_start, loc_end, x_guess, n_iter=80):
     x0 = x_guess * 0.99
     x1 = x_guess * 1.01
@@ -49,6 +62,37 @@ def _find_eigenvalue(B1, h, rho, loc_start, loc_end, x_guess, n_iter=80):
         if abs(d1) < 1e-14:
             break
     return x1
+
+
+def _find_eigenvalue_bottom_bc(B1, h, rho, loc_start, loc_end, x_guess, alpha, beta, n_iter=80):
+    x0 = 1e-4
+    x1 = max(0.5, 4.0 * x_guess)
+    n_scan = 400
+    dx = (x1 - x0) / n_scan
+    left = x0
+    d0 = _eval_delta_bottom_bc(left, B1, h, rho, loc_start, loc_end, alpha, beta)
+    right = left
+    d1 = d0
+
+    for i in range(1, n_scan + 1):
+        right = x0 + i * dx
+        d1 = _eval_delta_bottom_bc(right, B1, h, rho, loc_start, loc_end, alpha, beta)
+        if d0 == 0.0 or d0 * d1 < 0.0:
+            break
+        left, d0 = right, d1
+    else:
+        raise RuntimeError("failed to bracket eigenvalue with bottom-BC x dependence")
+
+    for _ in range(n_iter):
+        x_mid = 0.5 * (left + right)
+        d_mid = _eval_delta_bottom_bc(x_mid, B1, h, rho, loc_start, loc_end, alpha, beta)
+        if abs(d_mid) < 1e-14 or abs(right - left) < 1e-14:
+            break
+        if d0 * d_mid <= 0.0:
+            right, d1 = x_mid, d_mid
+        else:
+            left, d0 = x_mid, d_mid
+    return 0.5 * (left + right)
 
 
 @pytest.fixture
@@ -124,6 +168,48 @@ def test_batched_multiple_modes():
     assert B1_a.grad is not None
     assert torch.isfinite(B1_a.grad).all()
     assert B1_a.grad[10:-10].abs().max().item() > 1e-10
+
+
+def test_gradient_finite_difference_bottom_bc_x_dependence():
+    B1_orig, rho, h, omega, k_water, n_points = _pekeris_setup()
+    loc_start, loc_end = 0, n_points
+    alpha = 0.05
+    beta = 0.02
+    x_star = _find_eigenvalue_bottom_bc(
+        B1_orig, h, rho, loc_start, loc_end, k_water**2 * 0.95, alpha, beta
+    )
+
+    B1 = B1_orig.clone().requires_grad_(True)
+    x_converged = torch.tensor([x_star], dtype=torch.float64)
+    bcs = (
+        torch.ones(1, dtype=torch.float64),   # f_bc_top
+        torch.zeros(1, dtype=torch.float64),  # g_bc_top
+        torch.tensor([alpha * x_star], dtype=torch.float64),  # f_bc_bot
+        torch.tensor([1.0 + beta * x_star], dtype=torch.float64),  # g_bc_bot
+        torch.zeros(1, dtype=torch.float64),  # dfdx_top
+        torch.zeros(1, dtype=torch.float64),  # dgdx_top
+        torch.tensor([alpha], dtype=torch.float64),  # dfdx_bot
+        torch.tensor([beta], dtype=torch.float64),  # dgdx_bot
+    )
+
+    x_out = kraken_eigenvalue_ift(x_converged, B1, rho, h, loc_start, loc_end, *bcs, eps=1e-12)
+    x_out.sum().backward()
+    grad_analytic = B1.grad.clone()
+
+    eps = 1e-6
+    for j in [10, 25, 40]:
+        B1_p = B1_orig.clone()
+        B1_p[j] += eps
+        x_p = _find_eigenvalue_bottom_bc(B1_p, h, rho, loc_start, loc_end, x_star, alpha, beta)
+
+        B1_m = B1_orig.clone()
+        B1_m[j] -= eps
+        x_m = _find_eigenvalue_bottom_bc(B1_m, h, rho, loc_start, loc_end, x_star, alpha, beta)
+
+        fd = (x_p - x_m) / (2 * eps)
+        assert abs(grad_analytic[j].item() - fd) < abs(fd) * 0.01 + 1e-10, (
+            f"B1[{j}]: IFT={grad_analytic[j].item():.8e}, FD={fd:.8e}"
+        )
 
 
 def test_dispersion_zero_at_eigenvalue(pekeris):
