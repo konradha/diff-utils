@@ -7,7 +7,12 @@ from .logdet import (
 from .solve_banded import make_banded_csr, solve_banded, solve_banded_csr_values
 from .acoustic_recurrence import AcousticRecurrenceFn, acoustic_recurrence
 from .interp import SearchsortedLerpFn, searchsorted_lerp
-from .trapezoidal_dot import TrapezoidalNormFn, trapezoidal_normalization
+from .trapezoidal_dot import (
+    TrapezoidalMultiLayerNormFn,
+    TrapezoidalNormFn,
+    trapezoidal_multilayer_normalization,
+    trapezoidal_normalization,
+)
 from .eigenvalue_gate import eigenvalue_gate
 from .eigenvector_gate import (
     EigenvectorGateFn,
@@ -30,7 +35,9 @@ __all__ = [
     "acoustic_recurrence",
     "SearchsortedLerpFn",
     "searchsorted_lerp",
+    "TrapezoidalMultiLayerNormFn",
     "TrapezoidalNormFn",
+    "trapezoidal_multilayer_normalization",
     "trapezoidal_normalization",
     "eigenvalue_gate",
     "EigenvectorGateFn",
