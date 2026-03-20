@@ -49,7 +49,7 @@ def _run_recurrence_bwd(
 
 
 def _lorentz_inv(z: torch.Tensor, eps: float) -> torch.Tensor:
-    # z̄/(|z|² + ε²) 
+    # z̄/(|z|² + ε²)
     if z.is_complex():
         return z.conj() / (z.real**2 + z.imag**2 + eps * eps)
     return z / (z * z + eps * eps)
@@ -59,7 +59,7 @@ class KrakenEigenvalueIFT(torch.autograd.Function):
     @staticmethod
     def forward(
         x_converged: torch.Tensor,  # [M]
-        B1: torch.Tensor,           # [N]
+        B1: torch.Tensor,  # [N]
         rho_med: float,
         h_med: float,
         loc_start: int,
@@ -72,7 +72,7 @@ class KrakenEigenvalueIFT(torch.autograd.Function):
         dgdx_top: torch.Tensor,  # [M]
         dfdx_bot: torch.Tensor,  # [M]
         dgdx_bot: torch.Tensor,  # [M]
-        eps: float,              # Lorentz broadening width
+        eps: float,  # Lorentz broadening width
     ):
         return x_converged.detach().clone()
 

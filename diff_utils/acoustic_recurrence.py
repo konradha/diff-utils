@@ -89,7 +89,7 @@ def _backward_python(
     grad_p2_init = torch.zeros(M, dtype=h2k2.dtype, device=h2k2.device)
 
     for m in range(M):
-        hk_m = mc(h2k2[m])     # conjugate fwd coefficient
+        hk_m = mc(h2k2[m])  # conjugate fwd coefficient
         d_p2 = -grad_f_num[m]  # not conjugated grad
         d_p1 = -grad_g_val[m]
         d_p0 = grad_f_num[m]
@@ -97,7 +97,7 @@ def _backward_python(
         for s in range(sweep_len - 1, -1, -1):
             jj = loc_end - s
             p1_conj = mc(p_history[m, s])  # conj for grad accumulation
-            coeff = hk_m - mc(B1[jj])      # conj coefficient
+            coeff = hk_m - mc(B1[jj])  # conj coefficient
 
             d_p1_from_p2 = d_p2 * coeff
             d_p0_from_p2 = -d_p2

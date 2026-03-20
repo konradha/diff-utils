@@ -108,10 +108,10 @@ def eigenvector_gate(
 
 
 def eigenvector_gate_degpert(
-    phi: torch.Tensor,       # [M, N] mode shapes
-    x_star: torch.Tensor,    # [M] eigenvalues
-    d_vals: torch.Tensor,    # [N] tridiagonal diagonal
-    e_vals: torch.Tensor,    # [N-1] tridiagonal off-diagonal
+    phi: torch.Tensor,  # [M, N] mode shapes
+    x_star: torch.Tensor,  # [M] eigenvalues
+    d_vals: torch.Tensor,  # [N] tridiagonal diagonal
+    e_vals: torch.Tensor,  # [N-1] tridiagonal off-diagonal
     grad_phi: torch.Tensor,  # [M, N] gradient
     tau: float = 1e-8,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -150,9 +150,8 @@ def eigenvector_gate_degpert(
     # degenerates
     for cluster_indices in clusters:
         k = len(cluster_indices)
-        Phi_c = phi[cluster_indices]            # [k, N]
+        Phi_c = phi[cluster_indices]  # [k, N]
         grad_phi_c = grad_phi[cluster_indices]  # [k, N]
-
 
         A_Phi_c = torch.zeros_like(Phi_c)  # [k, N]
         for i in range(k):
@@ -173,7 +172,7 @@ def eigenvector_gate_degpert(
         # R rotates cluster modes into the right basis for degeneracy
         # Phi_eff = R.conj @ Phi_c gives mode shapesj
         if dtype.is_complex:
-            Phi_eff = R.conj().T @ Phi_c            # [k, N]
+            Phi_eff = R.conj().T @ Phi_c  # [k, N]
             grad_phi_eff = R.conj().T @ grad_phi_c  # [k, N]
         else:
             Phi_eff = R.T @ Phi_c
