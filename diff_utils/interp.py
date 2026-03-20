@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from banded._ext import _cpu_ext
+from diff_utils._ext import _cpu_ext
 
 
 class SearchsortedLerpFn(torch.autograd.Function):

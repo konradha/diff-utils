@@ -9,11 +9,9 @@ IPOWER_R = 50
 
 
 class ElasticPropagationFn(torch.autograd.Function):
-    """Differentiable 5-component elastic ODE propagation.
-
-    Forward: modified midpoint stepping with overflow rescaling.
-    Backward: reverse sweep adjoint ODE using stored y_history.
-    """
+    # 5-component elastic ODE
+    # fwd: modified midpoint stepping with overflow rescaling.
+    # bwd: reverse sweep adjoint ODE using history
 
     @staticmethod
     def forward(
@@ -164,7 +162,7 @@ def _backward_impl(
     loc_start,
     going_up,
 ):
-    """Reverse-sweep adjoint through the elastic propagation."""
+    # sweep ajoidnt
     N = B1.shape[0]
     dtype = y_history.dtype
     device = y_history.device
@@ -216,7 +214,7 @@ def _backward_impl(
         d_z = new_d_z
         d_y = new_d_y
 
-    # Initial half step
+    # half step to get running
     j0 = j_sequence[0]
     xB3_0 = x * B3[j0] - rho[j0]
     y0 = y_history[0]

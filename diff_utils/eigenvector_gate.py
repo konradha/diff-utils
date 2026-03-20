@@ -1,19 +1,6 @@
-"""Eigenvector gate: makes converged eigenvectors differentiable.
-
-Forward: passthrough (detach from inverse-iteration graph).
-Backward: Solve adjoint system (A - x*I) λ = g, then extract parameter gradients.
-
-When eigenvalues are near-degenerate (x_i ≈ x_j), the adjoint solve becomes
-ill-conditioned. `eigenvector_gate_degpert` handles this by projecting the
-perturbation into the degenerate subspace and re-diagonalizing — same pattern
-as build_F_degpert in tSVD, applied to the tridiagonal KRAKEN operator.
-"""
-
-from __future__ import annotations
-
 import torch
 
-from banded.solve_banded import make_banded_csr, solve_banded
+from diff_utils.solve_banded import make_banded_csr, solve_banded
 
 
 class EigenvectorGateFn(torch.autograd.Function):
@@ -87,7 +74,6 @@ def _backward_single(grad_phi, phi, x_star, d_vals, e_vals):
 
 
 def _find_clusters(x_star: torch.Tensor, tau: float):
-    """Detect clusters of near-degenerate eigenvalues."""
     if tau <= 0.0 or x_star.dim() == 0 or x_star.shape[0] < 2:
         return []
     M = x_star.shape[0]
@@ -106,7 +92,6 @@ def _find_clusters(x_star: torch.Tensor, tau: float):
 
 
 def _apply_tridiag(d, e, v):
-    """Compute A·v for tridiagonal A with diagonal d and off-diagonal e."""
     result = d * v
     result[:-1] += e * v[1:]
     result[1:] += e * v[:-1]
@@ -123,26 +108,19 @@ def eigenvector_gate(
 
 
 def eigenvector_gate_degpert(
-    phi: torch.Tensor,  # [M, N] mode shapes
-    x_star: torch.Tensor,  # [M] eigenvalues
-    d_vals: torch.Tensor,  # [N] tridiagonal diagonal (shared across modes)
-    e_vals: torch.Tensor,  # [N-1] tridiagonal off-diagonal (shared)
-    grad_phi: torch.Tensor,  # [M, N] incoming gradient
+    phi: torch.Tensor,       # [M, N] mode shapes
+    x_star: torch.Tensor,    # [M] eigenvalues
+    d_vals: torch.Tensor,    # [N] tridiagonal diagonal
+    e_vals: torch.Tensor,    # [N-1] tridiagonal off-diagonal
+    grad_phi: torch.Tensor,  # [M, N] gradient
     tau: float = 1e-8,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Eigenvector backward with degenerate perturbation theory.
-
-    For each cluster of near-degenerate eigenvalues {x_i₁, ..., x_ik}:
-
-    1. Build the k×k cluster Hamiltonian: H_ij = φ_i† · A · φ_j
-       where A is the tridiagonal operator.
-    2. Diagonalize H → effective eigenvalues x_eff that split the degeneracy.
-    3. Use x_eff in the adjoint solve instead of the original (degenerate) x_i.
-    4. Project out within-cluster components from the RHS of the adjoint solve
-       (these are handled by the H diagonalization, not the tridiag solve).
-
-    This is the KRAKEN analog of build_F_degpert in tSVD: project A·A† into
-    the degenerate subspace, re-diagonalize, use effective eigenvalues.
+    """
+    gor each cluster of near-degenerate eigenvalues {x_i1, ..., x_ik}:
+    - build k×k cluster Hamiltonian: H_ij = phi_iT x A x phi_j
+    - diagonalize H with effective eigenvalues x_eff that split degeneracy
+    - x_eff in the adjoint solve instead of degenerate x_i.
+    - project out within-cluster components from RHS of adjoint solve
     """
     M, N = phi.shape
     dtype = phi.dtype
@@ -157,7 +135,7 @@ def eigenvector_gate_degpert(
     for cl in clusters:
         in_cluster.update(cl)
 
-    # --- Non-degenerate modes: standard adjoint ---
+    # standard adjoint
     for m in range(M):
         if m in in_cluster:
             continue
@@ -169,14 +147,13 @@ def eigenvector_gate_degpert(
         if ge is not None:
             grad_e += ge
 
-    # --- Degenerate clusters: perturbation theory ---
+    # degenerates
     for cluster_indices in clusters:
         k = len(cluster_indices)
-        Phi_c = phi[cluster_indices]  # [k, N]
+        Phi_c = phi[cluster_indices]            # [k, N]
         grad_phi_c = grad_phi[cluster_indices]  # [k, N]
 
-        # Step 1: Build k×k cluster Hamiltonian H_ij = φ_i† · A · φ_j
-        # A is the tridiagonal with diagonal d_vals and off-diagonal e_vals
+
         A_Phi_c = torch.zeros_like(Phi_c)  # [k, N]
         for i in range(k):
             A_Phi_c[i] = _apply_tridiag(d_vals, e_vals, Phi_c[i])
@@ -186,24 +163,23 @@ def eigenvector_gate_degpert(
         else:
             H = Phi_c @ A_Phi_c.T  # [k, k]
 
-        # Step 2: Diagonalize H → effective eigenvalues
+        # eff eigenvalues
         if dtype.is_complex:
             x_eff, R = torch.linalg.eigh(0.5 * (H + H.conj().T))
             x_eff = x_eff.to(dtype)
         else:
             x_eff, R = torch.linalg.eigh(0.5 * (H + H.T))
 
-        # R rotates the cluster modes into the "correct" basis for the degeneracy
-        # Phi_eff = R† @ Phi_c gives the effective mode shapes
+        # R rotates cluster modes into the right basis for degeneracy
+        # Phi_eff = R.conj @ Phi_c gives mode shapesj
         if dtype.is_complex:
-            Phi_eff = R.conj().T @ Phi_c  # [k, N]
+            Phi_eff = R.conj().T @ Phi_c            # [k, N]
             grad_phi_eff = R.conj().T @ grad_phi_c  # [k, N]
         else:
             Phi_eff = R.T @ Phi_c
             grad_phi_eff = R.T @ grad_phi_c
 
-        # Step 3: Adjoint solve in the rotated basis with effective eigenvalues
-        # These are now well-separated (the degeneracy has been split)
+        # adjoint sovle
         for i in range(k):
             m = cluster_indices[i]
             _, gx, gd_i, ge_i = _backward_single(

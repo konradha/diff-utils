@@ -1,5 +1,3 @@
-"""Tests for the batched KRAKEN eigenvalue IFT gate."""
-
 from __future__ import annotations
 
 import sys
@@ -10,8 +8,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from banded.acoustic_recurrence import AcousticRecurrenceFn
-from banded.kraken_ift import kraken_eigenvalue_ift
+from diff_utils.acoustic_recurrence import AcousticRecurrenceFn
+from diff_utils.kraken_ift import kraken_eigenvalue_ift
 
 
 def _pekeris_setup(n_points=50, freq=100.0, c_water=1500.0, depth=100.0):
@@ -25,7 +23,6 @@ def _pekeris_setup(n_points=50, freq=100.0, c_water=1500.0, depth=100.0):
 
 
 def _eval_delta(x_val, B1, h, rho, loc_start, loc_end):
-    """Evaluate dispersion for vacuum-top, rigid-bottom Pekeris waveguide."""
     h2 = h * h
     h2k2 = torch.tensor([h2 * x_val], dtype=torch.float64)
     g_bot = torch.ones(1, dtype=torch.float64)
@@ -35,7 +32,6 @@ def _eval_delta(x_val, B1, h, rho, loc_start, loc_end):
     f_num, g_val, _ = AcousticRecurrenceFn.apply(
         B1.detach(), h2k2, loc_start, loc_end, p1_init, p2_init
     )
-    # Δ = f·g_top - g·f_top = (f_num/scale)·0 - g_val·1 = -g_val
     return -g_val[0].item()
 
 
@@ -64,7 +60,6 @@ def pekeris():
 
 
 def _make_bc_tensors(M, dtype=torch.float64):
-    """Vacuum top (f=1, g=0), rigid bottom (f=0, g=1), zero derivatives."""
     return (
         torch.ones(M, dtype=dtype),  # f_bc_top
         torch.zeros(M, dtype=dtype),  # g_bc_top

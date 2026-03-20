@@ -6,14 +6,9 @@ import torch
 
 
 class _EigenvalueGateWrapper(torch.autograd.Function):
-    """IFT wrapper: makes converged eigenvalues differentiable w.r.t. θ.
+    """IFT: makes converged eigenvalues differentiable wrt theta
 
-    Forward: passthrough (detach from root-finding graph).
-    Backward: Uses IFT: dx/dθ = -∂Δ/∂θ / ∂Δ/∂x, where Δ is the dispersion function.
-
-    The dispersion_fn must accept (x_scalar, *theta_tensors) and return a scalar.
-    Derivatives are computed by calling the dispersion function with autograd-tracked
-    inputs and using torch.autograd.grad to extract the partial derivatives.
+    bwd: dx/dtheta = -∂Delta/∂theta / ∂Delta/∂x; Delta is dispersion fun
     """
 
     @staticmethod
@@ -77,7 +72,6 @@ class _EigenvalueGateWrapper(torch.autograd.Function):
                         else:
                             grad_thetas[k] = grad_thetas[k] + float(ift_factor) * dD_dt
 
-        # None for x_converged, None for dispersion_fn, then grad for each theta
         return (None, None) + tuple(grad_thetas)
 
 

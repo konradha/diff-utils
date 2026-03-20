@@ -8,12 +8,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from banded.krakel_gate import krakel_eigenvalue_gate
-from banded.logdet import dense_to_lapack_band
+from diff_utils.krakel_gate import krakel_eigenvalue_gate
+from diff_utils.logdet import dense_to_lapack_band
 
 
 def _simple_tridiag_assemble(x, d_vals):
-    """Assemble a tridiagonal band matrix A(x) = diag(d-x) + off-diag(1)."""
     N = d_vals.shape[0]
     A = (
         torch.diag(d_vals - x)
@@ -26,10 +25,8 @@ def _simple_tridiag_assemble(x, d_vals):
 
 
 def test_krakel_eigenvalue_gate_runs():
-    """Basic smoke test."""
     d = torch.tensor([3.0, 4.0, 5.0], dtype=torch.float64, requires_grad=True)
 
-    # Find an eigenvalue of the tridiagonal matrix
     A = (
         torch.diag(d.detach())
         + torch.diag(torch.ones(2, dtype=torch.float64), 1)
@@ -43,7 +40,6 @@ def test_krakel_eigenvalue_gate_runs():
 
 
 def test_krakel_gradient_flows():
-    """Check gradients flow through the KRAKEL gate."""
     d = torch.tensor([3.0, 4.0, 5.0], dtype=torch.float64, requires_grad=True)
 
     A = (

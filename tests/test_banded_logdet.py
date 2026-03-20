@@ -10,7 +10,7 @@ import torch
 from scipy.linalg.lapack import dgbtrf
 from torch.autograd import gradcheck
 
-from banded import banded_logdet, dense_to_lapack_band, lapack_band_to_dense
+from diff_utils import banded_logdet, dense_to_lapack_band, lapack_band_to_dense
 
 
 def _random_banded_dense(n: int, kl: int, ku: int, seed: int) -> torch.Tensor:
@@ -379,7 +379,7 @@ def test_complex_lapack_importable() -> None:
 
 
 def test_ext_caching() -> None:
-    from banded._ext import _cpu_ext
+    from diff_utils._ext import _cpu_ext
 
     ext1 = _cpu_ext()
     ext2 = _cpu_ext()

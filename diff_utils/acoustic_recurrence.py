@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from banded._ext import _cpu_ext
+from diff_utils._ext import _cpu_ext
 
 
 class AcousticRecurrenceFn(torch.autograd.Function):
@@ -63,6 +63,7 @@ class AcousticRecurrenceFn(torch.autograd.Function):
         return grad_B1, grad_h2k2, None, None, grad_p1_init, grad_p2_init
 
 
+# simplified fallback
 def _backward_python(
     grad_f_num,
     grad_g_val,
@@ -75,13 +76,11 @@ def _backward_python(
     p2_init,
     is_complex,
 ):
-    """Hand-written adjoint with Wirtinger handling for complex."""
     M = h2k2.shape[0]
     N = B1.shape[0]
     sweep_len = loc_end - loc_start + 1
 
     def mc(v):
-        """Conjugate coefficient for complex Wirtinger adjoint."""
         return v.conj() if is_complex else v
 
     grad_B1 = torch.zeros(N, dtype=B1.dtype, device=B1.device)
@@ -90,15 +89,15 @@ def _backward_python(
     grad_p2_init = torch.zeros(M, dtype=h2k2.dtype, device=h2k2.device)
 
     for m in range(M):
-        hk_m = mc(h2k2[m])  # conjugate forward coefficient
-        d_p2 = -grad_f_num[m]  # incoming grad NOT conjugated
+        hk_m = mc(h2k2[m])     # conjugate fwd coefficient
+        d_p2 = -grad_f_num[m]  # not conjugated grad
         d_p1 = -grad_g_val[m]
         d_p0 = grad_f_num[m]
 
         for s in range(sweep_len - 1, -1, -1):
             jj = loc_end - s
-            p1_conj = mc(p_history[m, s])  # conjugate for grad accumulation
-            coeff = hk_m - mc(B1[jj])  # conjugated coefficient
+            p1_conj = mc(p_history[m, s])  # conj for grad accumulation
+            coeff = hk_m - mc(B1[jj])      # conj coefficient
 
             d_p1_from_p2 = d_p2 * coeff
             d_p0_from_p2 = -d_p2

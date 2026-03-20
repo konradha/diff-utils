@@ -8,11 +8,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from banded.eigenvalue_gate import eigenvalue_gate
+from diff_utils.eigenvalue_gate import eigenvalue_gate
 
 
 def _simple_dispersion(x, a, b):
-    """Dispersion function: Δ(x; a, b) = a*x^2 + b*x - 1."""
     return a * x * x + b * x - 1.0
 
 
@@ -26,14 +25,9 @@ def test_passthrough():
 
 
 def test_analytic_gradient():
-    """For Δ = a*x^2 + b*x - 1, roots are x = (-b ± sqrt(b^2+4a)) / (2a).
-    dx/da at root x* = -x*^2 / (2*a*x* + b)
-    dx/db at root x* = -x* / (2*a*x* + b)
-    """
     a = torch.tensor(1.0, dtype=torch.float64, requires_grad=True)
     b = torch.tensor(-3.0, dtype=torch.float64, requires_grad=True)
 
-    # Find root analytically
     disc = b.detach() ** 2 + 4 * a.detach()
     x_star_val = (-b.detach() + torch.sqrt(disc)) / (2 * a.detach())
     x_converged = x_star_val.unsqueeze(0)
@@ -41,7 +35,6 @@ def test_analytic_gradient():
     x_out = eigenvalue_gate(x_converged, _simple_dispersion, a, b)
     x_out.sum().backward()
 
-    # Analytic: dx/da = -x^2 / (2ax+b), dx/db = -x / (2ax+b)
     denom = 2 * a.detach() * x_star_val + b.detach()
     expected_da = -(x_star_val**2) / denom
     expected_db = -x_star_val / denom
@@ -66,7 +59,6 @@ def test_finite_difference_validation():
     x_out.sum().backward()
     grad_a_ift = a.grad.item()
 
-    # Finite difference: perturb a, re-solve
     eps = 1e-7
     for sign in [1, -1]:
         a_pert = a.detach() + sign * eps
@@ -89,7 +81,6 @@ def test_finite_difference_validation():
 
 
 def test_batched_accumulation():
-    """Multiple modes accumulate gradients to shared params."""
     a = torch.tensor(1.0, dtype=torch.float64, requires_grad=True)
     b = torch.tensor(-5.0, dtype=torch.float64, requires_grad=True)
 
@@ -108,13 +99,10 @@ def test_batched_accumulation():
 
 
 def test_complex_eigenvalue():
-    """Test with complex dispersion function."""
-
     def complex_disp(x, c):
         return c * x * x - 1.0
 
     c = torch.tensor(1.0 + 0.1j, dtype=torch.complex128, requires_grad=True)
-    # Root: x = 1/sqrt(c)
     x_star = 1.0 / torch.sqrt(c.detach())
     x_converged = x_star.unsqueeze(0)
 

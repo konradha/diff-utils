@@ -106,14 +106,14 @@ def _backward_python(grad_sq, grad_sl, grad_pr, phi, B1, B1C, rho, h, omega2):
     else:
         grad_phi = d_phi.real.to(phi.dtype)
 
-    # grad_B1 (from slow term)
+    # grad_B1 [slow term]
     phi_sq = phi_c * phi_c
     grad_B1 = torch.zeros(N1, dtype=torch.float64, device=device)
     if rho_omega_h2 != 0.0:
         d_b1 = gsl * weights.to(torch.complex128) * phi_sq / rho_omega_h2
         grad_B1 = d_b1.real
 
-    # grad_B1C (from perturb term)
+    # grad_B1C [pertubation]
     d_b1c = gpr * 1j * weights.to(torch.complex128) * phi_sq / rho_val
     grad_B1C = d_b1c.real
 

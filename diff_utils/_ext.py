@@ -54,7 +54,7 @@ def _cpu_ext():
             from torch.utils.cpp_extension import load
 
             _CPU_EXT = load(
-                name="banded_cpu_kernels_v7",
+                name="diff_utils_cpu_kernels_v1",
                 sources=[str(src)],
                 extra_cflags=[
                     "-O3",

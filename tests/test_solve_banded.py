@@ -9,7 +9,7 @@ import pytest
 import torch
 from torch.autograd import gradcheck
 
-from banded import make_banded_csr, solve_banded, solve_banded_csr_values
+from diff_utils import make_banded_csr, solve_banded, solve_banded_csr_values
 
 scipy_linalg = pytest.importorskip("scipy.linalg")
 

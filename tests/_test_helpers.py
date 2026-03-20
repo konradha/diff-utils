@@ -96,6 +96,6 @@ def pekeris_B1_rho_h(
 
 
 def dense_to_band_complex(A: torch.Tensor, kl: int, ku: int) -> torch.Tensor:
-    from banded.logdet import dense_to_lapack_band
+    from diff_utils.logdet import dense_to_lapack_band
 
     return dense_to_lapack_band(A, kl, ku)

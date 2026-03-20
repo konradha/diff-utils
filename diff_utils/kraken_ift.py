@@ -1,28 +1,11 @@
-"""Batched IFT backward for KRAKEN/KRAKENC eigenvalue differentiation.
-
-This replaces the generic eigenvalue_gate for the KRAKEN-specific dispersion
-function. Instead of looping over modes in Python and calling torch.autograd.grad,
-it computes all M modes' IFT gradients in one batched acoustic_recurrence call.
-
-Dispersion function structure:
-    Δ_m(x_m; B1, ρ, h, BCs) = f_m · g_top_m - g_m · f_top_m
-
-where (f_m, g_m) come from the acoustic recurrence with h2k2_m = h² · x_m,
-and (f_top_m, g_top_m) come from boundary conditions.
-
-IFT: dx_m/dθ = -(∂Δ_m/∂θ) / (∂Δ_m/∂x_m)
-
-Near-degenerate eigenvalues (∂Δ/∂x ≈ 0) are regularized via Lorentz
-broadening: 1/z → z̄/(|z|² + ε²), following the same pattern as the
-tSVD F-matrix regularization.
-"""
+# Batched IFT backward for KRAKEN/KRAKENC eigenvalue diff
 
 from __future__ import annotations
 
 import torch
 
-from banded._ext import _cpu_ext, _tensor_has_storage
-from banded.acoustic_recurrence import AcousticRecurrenceFn, _backward_python
+from diff_utils._ext import _cpu_ext, _tensor_has_storage
+from diff_utils.acoustic_recurrence import AcousticRecurrenceFn, _backward_python
 
 
 def _run_recurrence_bwd(
@@ -37,7 +20,6 @@ def _run_recurrence_bwd(
     p2_init,
     is_complex,
 ):
-    """Dispatch recurrence backward to C++ or Python."""
     ext = _cpu_ext()
     if ext is not None and _tensor_has_storage(B1):
         return ext.acoustic_recurrence_bwd(
@@ -67,29 +49,17 @@ def _run_recurrence_bwd(
 
 
 def _lorentz_inv(z: torch.Tensor, eps: float) -> torch.Tensor:
-    """Lorentz-broadened inverse: z̄/(|z|² + ε²).
-
-    For real z this is z/(z² + ε²).
-    For complex z this is conj(z)/(|z|² + ε²).
-    Smoothly regularizes 1/z near z=0 with maximum magnitude 1/(2ε).
-    """
+    # z̄/(|z|² + ε²) 
     if z.is_complex():
         return z.conj() / (z.real**2 + z.imag**2 + eps * eps)
     return z / (z * z + eps * eps)
 
 
 class KrakenEigenvalueIFT(torch.autograd.Function):
-    """Batched IFT for KRAKEN eigenvalues.
-
-    Forward: passthrough of converged eigenvalues.
-    Backward: batched dispersion derivative via acoustic recurrence backward.
-    Near-zero ∂Δ/∂x regularized via Lorentz broadening (eps parameter).
-    """
-
     @staticmethod
     def forward(
         x_converged: torch.Tensor,  # [M]
-        B1: torch.Tensor,  # [N]
+        B1: torch.Tensor,           # [N]
         rho_med: float,
         h_med: float,
         loc_start: int,
@@ -102,7 +72,7 @@ class KrakenEigenvalueIFT(torch.autograd.Function):
         dgdx_top: torch.Tensor,  # [M]
         dfdx_bot: torch.Tensor,  # [M]
         dgdx_bot: torch.Tensor,  # [M]
-        eps: float,  # Lorentz broadening width
+        eps: float,              # Lorentz broadening width
     ):
         return x_converged.detach().clone()
 
@@ -168,7 +138,6 @@ class KrakenEigenvalueIFT(torch.autograd.Function):
         scale = 2.0 * h_med * rho_med
         is_complex = x_converged.is_complex()
 
-        # --- Forward recurrence at converged eigenvalues ---
         h2k2 = h2 * x_converged.detach()
 
         g_bot = g_bc_bot.detach()
@@ -190,14 +159,13 @@ class KrakenEigenvalueIFT(torch.autograd.Function):
         f_interior = f_num / scale
         g_interior = g_val
 
-        # --- Dispersion partial derivatives ---
+        # dispersion partials
         g_top = g_bc_top.detach()
         f_top = f_bc_top.detach()
 
         grad_f_num_unit = g_top / scale
         grad_g_val_unit = -f_top
 
-        # Recurrence backward → ∂Δ/∂B1, ∂Δ/∂h2k2, ∂Δ/∂p_init
         grad_B1_delta, grad_h2k2_delta, grad_p1i_delta, grad_p2i_delta = _run_recurrence_bwd(
             grad_f_num_unit,
             grad_g_val_unit,
@@ -211,21 +179,17 @@ class KrakenEigenvalueIFT(torch.autograd.Function):
             is_complex,
         )
 
-        # Chain through initial conditions
+        # chain ICs
         grad_B1_delta[loc_end] += (grad_p2i_delta * g_bot).sum()
         grad_h2k2_delta += grad_p2i_delta * (-g_bot)
 
-        # ∂Δ/∂x = (interior via h2k2) + (boundary)
+        # dDelta/dx = interior via h2k2 + bdry
         dDelta_dx = grad_h2k2_delta * h2 + (
             f_interior.detach() * dgdx_top.detach() - g_interior.detach() * dfdx_top.detach()
         )
 
-        # --- IFT with Lorentz-broadened inverse ---
-        # ift_scale_m = -grad_x_m / (∂Δ_m/∂x_m)
-        #             → -grad_x_m · conj(∂Δ/∂x) / (|∂Δ/∂x|² + ε²)
         ift_scale = -grad_x * _lorentz_inv(dDelta_dx, eps)
 
-        # Rerun backward with IFT-scaled gradients → grad_B1
         grad_f_num_ift = ift_scale * g_top / scale
         grad_g_val_ift = ift_scale * (-f_top)
 
@@ -281,16 +245,6 @@ def kraken_eigenvalue_ift(
     *,
     eps: float = 1e-12,
 ) -> torch.Tensor:
-    """Batched IFT gate for KRAKEN eigenvalues.
-
-    Returns eigenvalues with gradients flowing back to B1.
-    All M modes processed in one batched call — no Python loop.
-
-    Args:
-        eps: Lorentz broadening width for regularizing 1/(∂Δ/∂x) near
-             degenerate eigenvalues. Default 1e-12. Set larger (e.g. 1e-6)
-             for problems with near-degenerate modes.
-    """
     return KrakenEigenvalueIFT.apply(
         x_converged,
         B1,

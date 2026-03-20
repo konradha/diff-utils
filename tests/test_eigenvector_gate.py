@@ -8,18 +8,16 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from banded.eigenvector_gate import eigenvector_gate, eigenvector_gate_degpert
+from diff_utils.eigenvector_gate import eigenvector_gate, eigenvector_gate_degpert
 
 
 def _build_tridiagonal(d, e):
-    """Build dense tridiagonal matrix from diagonal d and off-diagonal e."""
     N = d.shape[0]
     A = torch.diag(d) + torch.diag(e, 1) + torch.diag(e, -1)
     return A
 
 
 def _inverse_iteration(A, x_star, tol=1e-14, max_iter=100):
-    """Simple inverse iteration to find eigenvector."""
     N = A.shape[0]
     v = torch.randn(N, dtype=A.dtype)
     v = v / v.norm()
@@ -46,7 +44,6 @@ def test_passthrough():
 
 
 def test_analytic_4x4():
-    """4x4 symmetric tridiagonal with known eigenvectors."""
     d = torch.tensor([2.0, 3.0, 4.0, 2.5], dtype=torch.float64)
     e = torch.tensor([0.5, 0.3, 0.4], dtype=torch.float64)
 
@@ -71,12 +68,6 @@ def test_analytic_4x4():
 
 
 def test_finite_difference_diagonal():
-    """Verify gradient w.r.t. d by finite differences.
-
-    Note: The adjoint system (A-x*I) is near-singular at a true eigenvalue,
-    so numerical accuracy is limited. We verify the gradient is finite and
-    has the right order of magnitude.
-    """
     N = 5
     torch.manual_seed(42)
     d = torch.tensor([3.0, 2.0, 4.0, 1.0, 5.0], dtype=torch.float64)
@@ -93,13 +84,11 @@ def test_finite_difference_diagonal():
     loss = (phi_out * torch.arange(1, N + 1, dtype=torch.float64)).sum()
     loss.backward()
 
-    # The gradient should be finite (the adjoint solve handles the near-singularity)
     assert d_a.grad is not None
     assert torch.isfinite(d_a.grad).all()
 
 
 def test_null_space_projection():
-    """Verify the null-space component of grad_phi is removed."""
     N = 5
     torch.manual_seed(123)
     d = torch.randn(N, dtype=torch.float64) + 3.0
@@ -113,30 +102,20 @@ def test_null_space_projection():
     x_star = evals[0].clone()
 
     phi_out = eigenvector_gate(phi, x_star, d_a, e)
-    # Use a loss that has a component along phi
     loss = (phi_out * phi).sum()
     loss.backward()
 
-    # The gradient should still be finite (null-space projection handles it)
     assert d_a.grad is not None
     assert torch.isfinite(d_a.grad).all()
 
 
 def test_degpert_near_degenerate():
-    """Two near-degenerate eigenvalues: degpert should produce finite gradients.
-
-    Construct a symmetric tridiagonal where eigenvalues 0 and 1 are separated
-    by ~1e-8 by direct spectral construction (full dense, then use as-is).
-    """
     N = 10
     torch.manual_seed(999)
 
-    # Start with well-separated eigenvalues
     evals_target = torch.linspace(1.0, 5.0, N, dtype=torch.float64)
-    # Force near-degeneracy in the first two
     evals_target[1] = evals_target[0] + 1e-8
 
-    # Random orthogonal matrix
     Q, _ = torch.linalg.qr(torch.randn(N, N, dtype=torch.float64))
     A = Q @ torch.diag(evals_target) @ Q.T
     A = 0.5 * (A + A.T)  # ensure symmetric
@@ -144,22 +123,17 @@ def test_degpert_near_degenerate():
     evals, evecs = torch.linalg.eigh(A)
     assert (evals[1] - evals[0]).abs() < 1e-6, "Eigenvalues not close enough"
 
-    # Use the FULL dense matrix (not tridiag extraction) — just pass diagonal/offdiag
-    # For this test, use the dense matrix's diagonal and first off-diagonal
     d = A.diagonal().clone()
     e = A.diagonal(1).clone()
 
-    # Recompute with the tridiag approximation
     A_tri = _build_tridiagonal(d, e)
     evals_tri, evecs_tri = torch.linalg.eigh(A_tri)
 
-    # Take first 3 modes
     M = 3
     phi = evecs_tri[:, :M].T.contiguous()
     x_star = evals_tri[:M].contiguous()
     grad_phi = torch.randn(M, N, dtype=torch.float64)
 
-    # Run degpert backward — should handle near-degeneracy gracefully
     grad_x, grad_d, grad_e = eigenvector_gate_degpert(
         phi,
         x_star,
@@ -175,7 +149,6 @@ def test_degpert_near_degenerate():
 
 
 def test_degpert_no_clusters_matches_standard():
-    """When no eigenvalues are degenerate, degpert should give same result as standard."""
     N = 8
     torch.manual_seed(42)
     d = torch.randn(N, dtype=torch.float64) + 5.0  # well-separated
@@ -189,12 +162,10 @@ def test_degpert_no_clusters_matches_standard():
     x_star = evals[:M].contiguous()
     grad_phi = torch.randn(M, N, dtype=torch.float64)
 
-    # Degpert with tau small enough that nothing clusters
     grad_x_dp, grad_d_dp, grad_e_dp = eigenvector_gate_degpert(
         phi, x_star, d, e, grad_phi, tau=1e-15
     )
 
-    # Standard per-mode backward
     grad_x_std = torch.zeros(M, dtype=torch.float64)
     grad_d_std = torch.zeros(N, dtype=torch.float64)
     grad_e_std = torch.zeros(N - 1, dtype=torch.float64)
@@ -221,7 +192,6 @@ def test_degpert_no_clusters_matches_standard():
 
 
 def test_degpert_cluster_hamiltonian():
-    """Verify the k×k cluster Hamiltonian H_ij = φ_i† A φ_j is correct."""
     N = 6
     d = torch.tensor([2.0, 3.0, 2.5, 4.0, 1.5, 3.5], dtype=torch.float64)
     e = torch.tensor([0.5, 0.3, 0.2, 0.4, 0.15], dtype=torch.float64)
@@ -229,12 +199,9 @@ def test_degpert_cluster_hamiltonian():
     A = _build_tridiagonal(d, e)
     evals, evecs = torch.linalg.eigh(A)
 
-    # Take two modes and compute their cluster Hamiltonian
     Phi_c = evecs[:, :2].T  # [2, N]
     A_Phi = (A @ evecs[:, :2]).T  # [2, N]
 
     H = Phi_c @ A_Phi.T  # [2, 2]
 
-    # H should be diagonal with the eigenvalues on the diagonal
-    # (since we used exact eigenvectors)
     assert torch.allclose(H, torch.diag(evals[:2]), atol=1e-12)

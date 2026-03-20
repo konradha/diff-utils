@@ -9,11 +9,10 @@ from torch.autograd import gradcheck
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from banded.elastic_propagation import elastic_propagation, ElasticPropagationFn
+from diff_utils.elastic_propagation import elastic_propagation, ElasticPropagationFn
 
 
 def _make_elastic_layer(n_steps=5, seed=42):
-    """Create a simple elastic layer for testing."""
     torch.manual_seed(seed)
     N = n_steps + 2
     B1 = torch.randn(N, dtype=torch.float64) * 0.01
@@ -37,7 +36,6 @@ def test_forward_runs():
 
 
 def test_forward_direction_consistency():
-    """Going up and down with reversed material should give related results."""
     B1, B2, B3, B4, rho, x, y_init, h_step, n_steps, loc_start = _make_elastic_layer(n_steps=3)
 
     y_up, _ = elastic_propagation(
@@ -47,7 +45,6 @@ def test_forward_direction_consistency():
         B1, B2, B3, B4, rho, x, y_init, h_step, n_steps, loc_start, going_up=False
     )
 
-    # Just check both produce finite results (direction changes the answer)
     assert torch.isfinite(y_up).all()
     assert torch.isfinite(y_down).all()
 
@@ -90,7 +87,6 @@ def test_gradcheck_y_init():
 
 
 def test_gradcheck_x():
-    """Test gradient w.r.t. the eigenvalue x via finite differences."""
     n_steps = 3
     B1, B2, B3, B4, rho, x, y_init, h_step, _, loc_start = _make_elastic_layer(n_steps=n_steps)
 

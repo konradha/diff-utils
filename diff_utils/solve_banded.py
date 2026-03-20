@@ -7,7 +7,7 @@ from typing import Dict, Tuple
 import numpy as np
 import torch
 
-from banded._ext import _cpu_ext, _tensor_has_storage
+from diff_utils._ext import _cpu_ext, _tensor_has_storage
 
 
 @dataclass(frozen=True)

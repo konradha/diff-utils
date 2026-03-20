@@ -4,8 +4,8 @@ from typing import Callable
 
 import torch
 
-from banded.logdet import banded_logdet
-from banded.eigenvalue_gate import eigenvalue_gate
+from diff_utils.logdet import banded_logdet
+from diff_utils.eigenvalue_gate import eigenvalue_gate
 
 
 def krakel_eigenvalue_gate(
