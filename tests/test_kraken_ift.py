@@ -182,7 +182,7 @@ def test_gradient_finite_difference_bottom_bc_x_dependence():
     B1 = B1_orig.clone().requires_grad_(True)
     x_converged = torch.tensor([x_star], dtype=torch.float64)
     bcs = (
-        torch.ones(1, dtype=torch.float64),   # f_bc_top
+        torch.ones(1, dtype=torch.float64),  # f_bc_top
         torch.zeros(1, dtype=torch.float64),  # g_bc_top
         torch.tensor([alpha * x_star], dtype=torch.float64),  # f_bc_bot
         torch.tensor([1.0 + beta * x_star], dtype=torch.float64),  # g_bc_bot
