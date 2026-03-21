@@ -833,12 +833,11 @@ static DispResult dispersion_eval(
 }
 
 static double zbrent(const double *b1, int64_t n_layers,
-                         const int64_t *layer_loc, const int64_t *layer_n,
-                         const double *layer_h, const double *layer_rho,
-                         double omega2, const AcousticBC &bc_bot,
-                         const AcousticBC &bc_top, double x1, double x2,
-                         double tol, int64_t mode,
-                         const double *prev_eigenvalues) {
+                     const int64_t *layer_loc, const int64_t *layer_n,
+                     const double *layer_h, const double *layer_rho,
+                     double omega2, const AcousticBC &bc_bot,
+                     const AcousticBC &bc_top, double x1, double x2, double tol,
+                     int64_t mode, const double *prev_eigenvalues) {
 
   auto r1 =
       dispersion_eval(x1, b1, n_layers, layer_loc, layer_n, layer_h, layer_rho,
@@ -923,11 +922,11 @@ static double zbrent(const double *b1, int64_t n_layers,
 }
 
 static double secant(const double *b1, int64_t n_layers,
-                         const int64_t *layer_loc, const int64_t *layer_n,
-                         const double *layer_h, const double *layer_rho,
-                         double omega2, const AcousticBC &bc_bot,
-                         const AcousticBC &bc_top, double x_init, double tol,
-                         int64_t mode, const double *prev_eigenvalues) {
+                     const int64_t *layer_loc, const int64_t *layer_n,
+                     const double *layer_h, const double *layer_rho,
+                     double omega2, const AcousticBC &bc_bot,
+                     const AcousticBC &bc_top, double x_init, double tol,
+                     int64_t mode, const double *prev_eigenvalues) {
 
   double x2 = x_init;
   double x1 = x2 + 10.0 * tol;
@@ -961,7 +960,6 @@ static double secant(const double *b1, int64_t n_layers,
   }
   return x2;
 }
-
 
 std::tuple<torch::Tensor, int64_t> acoustic_solve1(
     torch::Tensor B1, torch::Tensor layer_loc_t, torch::Tensor layer_n_t,
@@ -1033,12 +1031,11 @@ std::tuple<torch::Tensor, int64_t> acoustic_solve1(
   for (int64_t mode = 0; mode < M; ++mode) {
     double eps = std::abs(x_r[mode]) * std::pow(10.0, 2.0 - precision);
     ev[mode] = zbrent(b1, n_layers, ll, ln, lh, lr, omega2, bc_bot, bc_top,
-                          x_l[mode], x_r[mode], eps, mode, ev);
+                      x_l[mode], x_r[mode], eps, mode, ev);
   }
 
   return std::make_tuple(eigenvalues, M);
 }
-
 
 std::tuple<torch::Tensor, int64_t>
 acoustic_solve2(torch::Tensor B1, torch::Tensor layer_loc_t,
@@ -1073,7 +1070,7 @@ acoustic_solve2(torch::Tensor B1, torch::Tensor layer_loc_t,
         std::abs(x_init) * (double)n_total * std::pow(10.0, 1.0 - precision);
 
     ev[mode] = secant(b1, n_layers, ll, ln, lh, lr, omega2, bc_bot, bc_top,
-                          x_init, tol, mode, ev);
+                      x_init, tol, mode, ev);
 
     if (omega2 / (c_high * c_high) > ev[mode]) {
       return std::make_tuple(eigenvalues.slice(0, 0, mode), mode);

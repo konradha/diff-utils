@@ -33,7 +33,10 @@ from .eigvec_adjoint import (
     eigvec_reattach,
     eigvec_degpert,
     tridiag_eigvec_adjoint,
+    tridiag_eigvec_adjoint_batch,
+    tridiag_eigvec_cluster_adjoint,
     tridiag_eigvec_reattach,
+    tridiag_eigvec_cluster_reattach,
 )
 from .elastic_propagation import ElasticPropagationFn, elastic_propagation
 from .krakel_ift import krakel_eigenvalue_ift
@@ -77,7 +80,10 @@ __all__ = [
     "eigvec_reattach",
     "eigvec_degpert",
     "tridiag_eigvec_adjoint",
+    "tridiag_eigvec_adjoint_batch",
+    "tridiag_eigvec_cluster_adjoint",
     "tridiag_eigvec_reattach",
+    "tridiag_eigvec_cluster_reattach",
     "ElasticPropagationFn",
     "elastic_propagation",
     "krakel_eigenvalue_ift",

@@ -92,10 +92,231 @@ def _find_clusters(x_star: torch.Tensor, tau: float):
 
 
 def _apply_tridiag(d, e, v):
-    result = d * v
-    result[:-1] += e * v[1:]
-    result[1:] += e * v[:-1]
+    if v.dim() == 1:
+        result = d * v
+        result[:-1] += e * v[1:]
+        result[1:] += e * v[:-1]
+        return result
+
+    result = v * d.unsqueeze(0)
+    result[:, :-1] += v[:, 1:] * e.unsqueeze(0)
+    result[:, 1:] += v[:, :-1] * e.unsqueeze(0)
     return result
+
+
+def _orthonormalize_basis(basis: torch.Tensor) -> torch.Tensor:
+    if basis.dim() == 1:
+        norm = basis.norm().clamp(min=1e-30)
+        return (basis / norm).unsqueeze(0)
+    Q, _ = torch.linalg.qr(basis.T, mode="reduced")
+    return Q.T.contiguous()
+
+
+def _project_orthogonal(v, phi):
+    return _project_orthogonal_subspace(v, phi.unsqueeze(0))
+
+
+def _project_orthogonal_subspace(v, basis: torch.Tensor):
+    basis_orth = _orthonormalize_basis(basis)
+    if v.dim() == 1:
+        if basis_orth.is_complex():
+            coeff = basis_orth.conj() @ v
+        else:
+            coeff = basis_orth @ v
+        return v - basis_orth.T @ coeff
+
+    if basis_orth.is_complex():
+        coeff = basis_orth.conj() @ v.T
+    else:
+        coeff = basis_orth @ v.T
+    projected = v.T - basis_orth.T @ coeff
+    return projected.T.contiguous()
+
+
+def _rayleigh_quotient(phi, d_vals, e_vals):
+    A_phi = _apply_tridiag(d_vals, e_vals, phi)
+    if phi.is_complex():
+        num = torch.dot(phi.conj(), A_phi)
+        den = torch.dot(phi.conj(), phi)
+    else:
+        num = torch.dot(phi, A_phi)
+        den = torch.dot(phi, phi)
+    return num / den
+
+
+def _rayleigh_quotient_batch(phi_batch, d_vals, e_vals):
+    A_phi = _apply_tridiag(d_vals, e_vals, phi_batch)
+    if phi_batch.is_complex():
+        num = (phi_batch.conj() * A_phi).sum(dim=1)
+        den = (phi_batch.conj() * phi_batch).sum(dim=1)
+    else:
+        num = (phi_batch * A_phi).sum(dim=1)
+        den = (phi_batch * phi_batch).sum(dim=1)
+    return num / den
+
+
+def _cg_solve_normal_equation(
+    basis,
+    d_vals,
+    e_vals,
+    sigma,
+    rhs,
+    *,
+    max_iter=None,
+    tol=1e-10,
+    reg=1e-12,
+):
+    N = rhs.shape[0]
+    if max_iter is None:
+        max_iter = max(64, min(8 * N, 4096))
+
+    shifted_d = d_vals - sigma
+    basis_orth = _orthonormalize_basis(basis)
+
+    def K(v):
+        return _project_orthogonal_subspace(_apply_tridiag(shifted_d, e_vals, v), basis_orth)
+
+    def B(v):
+        return _project_orthogonal_subspace(K(K(v)) + reg * v, basis_orth)
+
+    b = _project_orthogonal_subspace(K(rhs), basis_orth)
+    x = torch.zeros_like(rhs)
+    r = b.clone()
+    p = r.clone()
+
+    if rhs.is_complex():
+        rs_old = torch.dot(r.conj(), r).real
+    else:
+        rs_old = torch.dot(r, r)
+    b_norm = rs_old.sqrt().clamp(min=1e-30)
+
+    converged = bool((rs_old.sqrt() / b_norm) <= tol)
+    n_iter = 0
+
+    for it in range(max_iter):
+        Ap = B(p)
+        if rhs.is_complex():
+            denom = torch.dot(p.conj(), Ap)
+        else:
+            denom = torch.dot(p, Ap)
+        if denom.abs().item() < 1e-30:
+            break
+        alpha = rs_old / denom
+        x = x + alpha * p
+        r = _project_orthogonal_subspace(r - alpha * Ap, basis_orth)
+        if rhs.is_complex():
+            rs_new = torch.dot(r.conj(), r).real
+        else:
+            rs_new = torch.dot(r, r)
+        n_iter = it + 1
+        if (rs_new.sqrt() / b_norm) <= tol:
+            converged = True
+            break
+        beta = rs_new / rs_old.clamp(min=1e-30)
+        p = r + beta * p
+        rs_old = rs_new
+
+    x = _project_orthogonal_subspace(x, basis_orth)
+    residual = _project_orthogonal_subspace(K(x) - rhs, basis_orth)
+    if rhs.is_complex():
+        rel_res = torch.dot(residual.conj(), residual).real.sqrt() / rhs.norm().clamp(min=1e-30)
+    else:
+        rel_res = torch.dot(residual, residual).sqrt() / rhs.norm().clamp(min=1e-30)
+    return x, bool(converged), float(rel_res.item()), n_iter
+
+
+def _project_rows_orthogonal(v_batch, basis_batch):
+    if basis_batch.is_complex():
+        coeff = (basis_batch.conj() * v_batch).sum(dim=1, keepdim=True)
+    else:
+        coeff = (basis_batch * v_batch).sum(dim=1, keepdim=True)
+    return v_batch - coeff * basis_batch
+
+
+def _apply_shifted_tridiag_batch(shifted_d_batch, e_vals, v_batch):
+    result = shifted_d_batch * v_batch
+    result[:, :-1] += v_batch[:, 1:] * e_vals.unsqueeze(0)
+    result[:, 1:] += v_batch[:, :-1] * e_vals.unsqueeze(0)
+    return result
+
+
+def _cg_solve_normal_equation_batch(
+    phi_batch,
+    d_vals,
+    e_vals,
+    sigma_batch,
+    rhs_batch,
+    *,
+    max_iter=None,
+    tol=1e-10,
+    reg=1e-12,
+):
+    M, N = rhs_batch.shape
+    if max_iter is None:
+        max_iter = max(64, min(8 * N, 4096))
+
+    phi_batch = _orthonormalize_basis(phi_batch) if M == 1 else phi_batch
+    shifted_d_batch = d_vals.unsqueeze(0) - sigma_batch.unsqueeze(1)
+
+    def K(v):
+        return _project_rows_orthogonal(
+            _apply_shifted_tridiag_batch(shifted_d_batch, e_vals, v),
+            phi_batch,
+        )
+
+    def B(v):
+        return _project_rows_orthogonal(K(K(v)) + reg * v, phi_batch)
+
+    b = _project_rows_orthogonal(K(rhs_batch), phi_batch)
+    x = torch.zeros_like(rhs_batch)
+    r = b.clone()
+    p = r.clone()
+
+    if rhs_batch.is_complex():
+        rs_old = (r.conj() * r).sum(dim=1).real
+    else:
+        rs_old = (r * r).sum(dim=1)
+    b_norm = rs_old.sqrt().clamp(min=1e-30)
+    converged = (rs_old.sqrt() / b_norm) <= tol
+
+    for _ in range(max_iter):
+        if bool(converged.all()):
+            break
+        Ap = B(p)
+        if rhs_batch.is_complex():
+            denom = (p.conj() * Ap).sum(dim=1)
+        else:
+            denom = (p * Ap).sum(dim=1)
+        safe = (~converged) & (denom.abs() > 1e-30)
+        if not bool(safe.any()):
+            break
+
+        alpha = torch.zeros_like(denom)
+        alpha[safe] = rs_old[safe] / denom[safe]
+        x = x + alpha.unsqueeze(1) * p
+        r = _project_rows_orthogonal(r - alpha.unsqueeze(1) * Ap, phi_batch)
+
+        if rhs_batch.is_complex():
+            rs_new = (r.conj() * r).sum(dim=1).real
+        else:
+            rs_new = (r * r).sum(dim=1)
+        newly_converged = (rs_new.sqrt() / b_norm) <= tol
+        beta = torch.zeros_like(rs_new)
+        active = safe & (~newly_converged)
+        beta[active] = rs_new[active] / rs_old[active].clamp(min=1e-30)
+        p = r + beta.unsqueeze(1) * p
+        rs_old = rs_new
+        converged = converged | newly_converged
+
+    x = _project_rows_orthogonal(x, phi_batch)
+    residual = _project_rows_orthogonal(K(x) - rhs_batch, phi_batch)
+    if rhs_batch.is_complex():
+        rel_res = (residual.conj() * residual).sum(dim=1).real.sqrt() / rhs_batch.norm(dim=1).clamp(
+            min=1e-30
+        )
+    else:
+        rel_res = (residual * residual).sum(dim=1).sqrt() / rhs_batch.norm(dim=1).clamp(min=1e-30)
+    return x, converged, rel_res
 
 
 def eigvec_reattach(
@@ -188,7 +409,7 @@ def eigvec_degpert(
     return grad_x, grad_d, grad_e
 
 
-def tridiag_eigvec_adjoint(
+def _tridiag_eigvec_adjoint_dense_oracle(
     phi: torch.Tensor,
     d_vals: torch.Tensor,
     e_vals: torch.Tensor,
@@ -233,6 +454,150 @@ def tridiag_eigvec_adjoint(
     return grad_d_out, grad_e_out
 
 
+def tridiag_eigvec_adjoint(
+    phi: torch.Tensor,
+    d_vals: torch.Tensor,
+    e_vals: torch.Tensor,
+    grad_phi: torch.Tensor,
+    *,
+    tau: float = 1e-8,
+    eps: float = 1e-10,
+    max_iter: int | None = None,
+    tol: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    phi_ref = phi.detach()
+    grad_phi_ref = grad_phi
+
+    sigma_m = _rayleigh_quotient(phi_ref, d_vals.detach(), e_vals.detach()).real.to(d_vals.dtype)
+    g = _project_orthogonal(grad_phi_ref, phi_ref)
+
+    lam, _, _, _ = _cg_solve_normal_equation(
+        phi_ref.unsqueeze(0),
+        d_vals,
+        e_vals,
+        sigma_m,
+        g,
+        max_iter=max_iter,
+        tol=tol,
+        reg=max(eps * eps, 1e-14),
+    )
+
+    grad_d_out = -lam * phi_ref
+    grad_e_out = -lam[:-1] * phi_ref[1:] - lam[1:] * phi_ref[:-1]
+    return grad_d_out, grad_e_out
+
+
+def tridiag_eigvec_cluster_adjoint(
+    phi_cluster: torch.Tensor,
+    d_vals: torch.Tensor,
+    e_vals: torch.Tensor,
+    grad_phi_cluster: torch.Tensor,
+    *,
+    eps: float = 1e-10,
+    max_iter: int | None = None,
+    tol: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    Phi_c = _orthonormalize_basis(phi_cluster.detach())
+    grad_phi_c = grad_phi_cluster
+
+    A_Phi = _apply_tridiag(d_vals, e_vals, Phi_c)
+    if Phi_c.is_complex():
+        H = Phi_c.conj() @ A_Phi.T
+        H = 0.5 * (H + H.conj().T)
+        sigma_eff, R = torch.linalg.eigh(H)
+        Phi_eff = R.conj().T @ Phi_c
+        grad_phi_eff = R.conj().T @ grad_phi_c
+    else:
+        H = Phi_c @ A_Phi.T
+        H = 0.5 * (H + H.T)
+        sigma_eff, R = torch.linalg.eigh(H)
+        Phi_eff = R.T @ Phi_c
+        grad_phi_eff = R.T @ grad_phi_c
+
+    grad_d = torch.zeros_like(d_vals)
+    grad_e = torch.zeros_like(e_vals)
+    basis_eff = _orthonormalize_basis(Phi_eff)
+
+    for i in range(Phi_eff.shape[0]):
+        rhs = _project_orthogonal_subspace(grad_phi_eff[i], basis_eff)
+        lam, _, _, _ = _cg_solve_normal_equation(
+            basis_eff,
+            d_vals,
+            e_vals,
+            sigma_eff[i].real.to(d_vals.dtype),
+            rhs,
+            max_iter=max_iter,
+            tol=tol,
+            reg=max(eps * eps, 1e-14),
+        )
+        phi_i = Phi_eff[i]
+        grad_d = grad_d - lam * phi_i
+        grad_e = grad_e - lam[:-1] * phi_i[1:] - lam[1:] * phi_i[:-1]
+
+    return grad_d, grad_e
+
+
+def tridiag_eigvec_adjoint_batch(
+    phi_batch: torch.Tensor,
+    d_vals: torch.Tensor,
+    e_vals: torch.Tensor,
+    grad_phi_batch: torch.Tensor,
+    *,
+    tau: float = 1e-8,
+    eps: float = 1e-10,
+    max_iter: int | None = None,
+    tol: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, _ = phi_batch.shape
+    sigma_batch = _rayleigh_quotient_batch(
+        phi_batch.detach(), d_vals.detach(), e_vals.detach()
+    ).real.to(d_vals.dtype)
+    clusters = _find_clusters(sigma_batch, tau)
+    in_cluster = set()
+    for cl in clusters:
+        in_cluster.update(cl)
+    isolated = [m for m in range(M) if m not in in_cluster]
+
+    grad_d = torch.zeros_like(d_vals)
+    grad_e = torch.zeros_like(e_vals)
+
+    if isolated:
+        iso_idx = torch.tensor(isolated, dtype=torch.long, device=phi_batch.device)
+        phi_iso = phi_batch.detach()[iso_idx]
+        grad_phi_iso = grad_phi_batch[iso_idx]
+        rhs_iso = _project_rows_orthogonal(grad_phi_iso, phi_iso)
+        lam_iso, _, _ = _cg_solve_normal_equation_batch(
+            phi_iso,
+            d_vals,
+            e_vals,
+            sigma_batch[iso_idx],
+            rhs_iso,
+            max_iter=max_iter,
+            tol=tol,
+            reg=max(eps * eps, 1e-14),
+        )
+        grad_d = grad_d - (lam_iso * phi_iso).sum(dim=0)
+        grad_e = grad_e - (lam_iso[:, :-1] * phi_iso[:, 1:] + lam_iso[:, 1:] * phi_iso[:, :-1]).sum(
+            dim=0
+        )
+
+    for cluster_indices in clusters:
+        idx = torch.tensor(cluster_indices, dtype=torch.long, device=phi_batch.device)
+        gd_i, ge_i = tridiag_eigvec_cluster_adjoint(
+            phi_batch[idx],
+            d_vals,
+            e_vals,
+            grad_phi_batch[idx],
+            eps=eps,
+            max_iter=max_iter,
+            tol=tol,
+        )
+        grad_d = grad_d + gd_i
+        grad_e = grad_e + ge_i
+
+    return grad_d, grad_e
+
+
 class TridiagEigvecAdjointFn(torch.autograd.Function):
     @staticmethod
     def forward(phi, d_vals, e_vals, tau, eps):
@@ -248,15 +613,49 @@ class TridiagEigvecAdjointFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_phi):
         phi, d_vals, e_vals = ctx.saved_tensors
-        grad_d, grad_e = tridiag_eigvec_adjoint(
-            phi,
+        if phi.dim() == 1:
+            grad_d, grad_e = tridiag_eigvec_adjoint(
+                phi,
+                d_vals,
+                e_vals,
+                grad_phi,
+                tau=ctx.tau,
+                eps=ctx.eps,
+            )
+        else:
+            grad_d, grad_e = tridiag_eigvec_adjoint_batch(
+                phi,
+                d_vals,
+                e_vals,
+                grad_phi,
+                tau=ctx.tau,
+                eps=ctx.eps,
+            )
+        return None, grad_d, grad_e, None, None
+
+
+class TridiagEigvecClusterAdjointFn(torch.autograd.Function):
+    @staticmethod
+    def forward(phi_cluster, d_vals, e_vals, eps):
+        return phi_cluster.detach().clone()
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        phi_cluster, d_vals, e_vals, eps = inputs
+        ctx.eps = eps
+        ctx.save_for_backward(phi_cluster, d_vals, e_vals)
+
+    @staticmethod
+    def backward(ctx, grad_phi_cluster):
+        phi_cluster, d_vals, e_vals = ctx.saved_tensors
+        grad_d, grad_e = tridiag_eigvec_cluster_adjoint(
+            phi_cluster,
             d_vals,
             e_vals,
-            grad_phi,
-            tau=ctx.tau,
+            grad_phi_cluster,
             eps=ctx.eps,
         )
-        return None, grad_d, grad_e, None, None
+        return None, grad_d, grad_e, None
 
 
 def tridiag_eigvec_reattach(
@@ -270,10 +669,23 @@ def tridiag_eigvec_reattach(
     return TridiagEigvecAdjointFn.apply(phi, d_vals, e_vals, tau, eps)
 
 
+def tridiag_eigvec_cluster_reattach(
+    phi_cluster: torch.Tensor,
+    d_vals: torch.Tensor,
+    e_vals: torch.Tensor,
+    *,
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    return TridiagEigvecClusterAdjointFn.apply(phi_cluster, d_vals, e_vals, eps)
+
+
 __all__ = [
     "EigvecReattachFn",
     "eigvec_reattach",
     "eigvec_degpert",
     "tridiag_eigvec_adjoint",
+    "tridiag_eigvec_adjoint_batch",
+    "tridiag_eigvec_cluster_adjoint",
     "tridiag_eigvec_reattach",
+    "tridiag_eigvec_cluster_reattach",
 ]
