@@ -710,6 +710,390 @@ acoustic_recurrence_scalar_counted(torch::Tensor B1, double h2k2,
   return std::make_tuple(f_num, g_val, mode_count);
 }
 
+// --- Full acoustic eigenvalue solver (solve1) ---
+// Eliminates all Python roundtrips from root-finding hot path.
+
+struct AcousticBC {
+  // type: 0=vacuum, 1=rigid, 2=acoustic halfspace, 3=elastic halfspace
+  int type;
+  double cp, cs, rho;
+};
+
+struct DispResult {
+  double Delta;
+  int64_t iPower;
+  int64_t mode_count;
+};
+
+static void bc_impedance(double x, double omega2, const AcousticBC &bc,
+                         bool is_top, double &f, double &g, int64_t &iPower,
+                         int64_t &mc) {
+  iPower = 0;
+  mc = 0;
+  if (bc.type == 0 || bc.rho == 0.0) { // vacuum
+    f = 1.0;
+    g = 0.0;
+    return;
+  }
+  if (bc.type == 1 || bc.rho >= 1e10) { // rigid
+    f = 0.0;
+    g = 1.0;
+    return;
+  }
+  if (bc.cs > 0.0) { // elastic halfspace
+    double gammaS2 = x - omega2 / (bc.cs * bc.cs);
+    double gammaP2 = x - omega2 / (bc.cp * bc.cp);
+    double gammaS = gammaS2 >= 0 ? std::sqrt(gammaS2) : 0.0;
+    double gammaP = gammaP2 >= 0 ? std::sqrt(gammaP2) : 0.0;
+    double mu = bc.rho * bc.cs * bc.cs;
+    f = omega2 * gammaP * (x - gammaS2);
+    g = ((gammaS2 + x) * (gammaS2 + x) - 4.0 * gammaS * gammaP * x) * mu;
+    if (g > 0.0)
+      mc = 1;
+  } else { // acoustic halfspace
+    double gamma2 = x - omega2 / (bc.cp * bc.cp);
+    f = gamma2 >= 0 ? std::sqrt(gamma2) : 0.0;
+    g = bc.rho;
+  }
+  if (is_top)
+    g = -g;
+}
+
+static const double FLOOR_V = 1e-50;
+static const double ROOF_V = 1e50;
+static const int64_t IPOWER_R_V = 50;
+static const int64_t IPOWER_F_V = -50;
+
+static DispResult dispersion_eval(
+    double x, const double *b1, int64_t n_layers, const int64_t *layer_loc,
+    const int64_t *layer_n, const double *layer_h, const double *layer_rho,
+    double omega2, const AcousticBC &bc_bot, const AcousticBC &bc_top,
+    bool count_modes, int64_t mode, const double *prev_eigenvalues) {
+
+  double f, g;
+  int64_t iPower = 0, mc_bc = 0;
+  bc_impedance(x, omega2, bc_bot, false, f, g, iPower, mc_bc);
+  int64_t mode_count = mc_bc;
+
+  for (int64_t li = n_layers - 1; li >= 0; --li) {
+    double h = layer_h[li];
+    double h2k2 = h * h * x;
+    double rho = layer_rho[li];
+    int64_t loc_s = layer_loc[li];
+    int64_t loc_e = loc_s + layer_n[li] - 1;
+
+    double p1v = -2.0 * g;
+    double p2v = (b1[loc_e] - h2k2) * g - 2.0 * h * f * rho;
+    double p0v = p1v;
+
+    int64_t sweep_len = loc_e - 1 - loc_s + 1;
+    for (int64_t s = 0; s < sweep_len; ++s) {
+      int64_t jj = (loc_e - 1) - s;
+      p0v = p1v;
+      p1v = p2v;
+      p2v = (h2k2 - b1[jj]) * p1v - p0v;
+      if (count_modes && p0v * p1v <= 0.0 && p0v != 0.0)
+        ++mode_count;
+    }
+
+    double rho_top = layer_rho[li]; // same rho for uniform layer
+    f = -(p2v - p0v) / (2.0 * h * rho_top);
+    g = -p1v;
+  }
+
+  double f_top, g_top;
+  int64_t ip_top = 0, mc_top = 0;
+  bc_impedance(x, omega2, bc_top, true, f_top, g_top, ip_top, mc_top);
+  iPower += ip_top;
+  mode_count += mc_top;
+
+  double Delta = f * g_top - g * f_top;
+
+  if (!count_modes && g * Delta > 0.0)
+    mode_count += 1;
+
+  // Eigenvalue deflation
+  if (mode > 0 && prev_eigenvalues != nullptr) {
+    for (int64_t j = 0; j < mode; ++j) {
+      double denom = x - prev_eigenvalues[j];
+      if (std::abs(denom) > 0.0)
+        Delta /= denom;
+      if (!std::isfinite(Delta)) {
+        Delta = ROOF_V;
+        iPower = 0;
+        break;
+      }
+      while (0.0 < std::abs(Delta) && std::abs(Delta) < FLOOR_V) {
+        Delta *= ROOF_V;
+        iPower -= IPOWER_R_V;
+      }
+      while (std::abs(Delta) > ROOF_V) {
+        Delta *= FLOOR_V;
+        iPower -= IPOWER_F_V;
+      }
+    }
+  }
+
+  return {Delta, iPower, mode_count};
+}
+
+// zbrent in C++
+static double zbrent_cpp(const double *b1, int64_t n_layers,
+                         const int64_t *layer_loc, const int64_t *layer_n,
+                         const double *layer_h, const double *layer_rho,
+                         double omega2, const AcousticBC &bc_bot,
+                         const AcousticBC &bc_top, double x1, double x2,
+                         double tol, int64_t mode,
+                         const double *prev_eigenvalues) {
+
+  auto r1 =
+      dispersion_eval(x1, b1, n_layers, layer_loc, layer_n, layer_h, layer_rho,
+                      omega2, bc_bot, bc_top, false, mode, prev_eigenvalues);
+  auto r2 =
+      dispersion_eval(x2, b1, n_layers, layer_loc, layer_n, layer_h, layer_rho,
+                      omega2, bc_bot, bc_top, false, mode, prev_eigenvalues);
+
+  int64_t ip_ref = std::max(r1.iPower, r2.iPower);
+  double f1 = r1.Delta * std::pow(10.0, (double)(r1.iPower - ip_ref));
+  double f2 = r2.Delta * std::pow(10.0, (double)(r2.iPower - ip_ref));
+
+  if (f1 * f2 > 0.0)
+    return 0.5 * (x1 + x2);
+
+  double a = x1, b = x2, fa = f1, fb = f2;
+  double c = b, fc = fb;
+  double d = b - a, e = d;
+
+  for (int iter = 0; iter < 200; ++iter) {
+    if (fb * fc > 0.0) {
+      c = a;
+      fc = fa;
+      d = e = b - a;
+    }
+    if (std::abs(fc) < std::abs(fb)) {
+      a = b;
+      fa = fb;
+      b = c;
+      fb = fc;
+      c = a;
+      fc = fa;
+    }
+
+    double tol1 = 2.0e-16 * std::abs(b) + 0.5 * tol;
+    double xm = 0.5 * (c - b);
+
+    if (std::abs(xm) <= tol1 || fb == 0.0)
+      return b;
+
+    if (std::abs(e) >= tol1 && std::abs(fa) > std::abs(fb)) {
+      double s = fb / fa;
+      double p, q;
+      if (a == c) {
+        p = 2.0 * xm * s;
+        q = 1.0 - s;
+      } else {
+        q = fa / fc;
+        double r = fb / fc;
+        p = s * (2.0 * xm * q * (q - r) - (b - a) * (r - 1.0));
+        q = (q - 1.0) * (r - 1.0) * (s - 1.0);
+      }
+      if (p > 0.0)
+        q = -q;
+      p = std::abs(p);
+      if (2.0 * p <
+          std::min(3.0 * xm * q - std::abs(tol1 * q), std::abs(e * q))) {
+        e = d;
+        d = p / q;
+      } else {
+        d = xm;
+        e = d;
+      }
+    } else {
+      d = xm;
+      e = d;
+    }
+
+    a = b;
+    fa = fb;
+    if (std::abs(d) > tol1)
+      b += d;
+    else
+      b += (xm >= 0.0 ? tol1 : -tol1);
+
+    auto rb =
+        dispersion_eval(b, b1, n_layers, layer_loc, layer_n, layer_h, layer_rho,
+                        omega2, bc_bot, bc_top, false, mode, prev_eigenvalues);
+    fb = rb.Delta * std::pow(10.0, (double)(rb.iPower - ip_ref));
+  }
+  return b;
+}
+
+// secant in C++
+static double secant_cpp(const double *b1, int64_t n_layers,
+                         const int64_t *layer_loc, const int64_t *layer_n,
+                         const double *layer_h, const double *layer_rho,
+                         double omega2, const AcousticBC &bc_bot,
+                         const AcousticBC &bc_top, double x_init, double tol,
+                         int64_t mode, const double *prev_eigenvalues) {
+
+  double x2 = x_init;
+  double x1 = x2 + 10.0 * tol;
+  auto r1 =
+      dispersion_eval(x1, b1, n_layers, layer_loc, layer_n, layer_h, layer_rho,
+                      omega2, bc_bot, bc_top, false, mode, prev_eigenvalues);
+  double f1 = r1.Delta;
+  int64_t ip1 = r1.iPower;
+
+  for (int iter = 0; iter < 2000; ++iter) {
+    double x0 = x1, f0 = f1;
+    int64_t ip0 = ip1;
+    x1 = x2;
+    auto r = dispersion_eval(x1, b1, n_layers, layer_loc, layer_n, layer_h,
+                             layer_rho, omega2, bc_bot, bc_top, false, mode,
+                             prev_eigenvalues);
+    f1 = r.Delta;
+    ip1 = r.iPower;
+
+    double c_num = f1 * (x1 - x0);
+    double c_den = f1 - f0 * std::pow(10.0, (double)(ip0 - ip1));
+    double shift;
+    if (std::abs(c_num) >= std::abs(c_den * x1))
+      shift = 0.1 * tol;
+    else
+      shift = c_num / c_den;
+
+    x2 = x1 - shift;
+    if (std::abs(x2 - x1) + std::abs(x2 - x0) < tol)
+      return x2;
+  }
+  return x2;
+}
+
+// Full solve1: bisection brackets + zbrent for all modes.
+// Returns eigenvalues tensor [M] and mode count M.
+std::tuple<torch::Tensor, int64_t> acoustic_solve1(
+    torch::Tensor B1, torch::Tensor layer_loc_t, torch::Tensor layer_n_t,
+    torch::Tensor layer_h_t, torch::Tensor layer_rho_t, double omega2,
+    int64_t bc_bot_type, double bc_bot_cp, double bc_bot_cs, double bc_bot_rho,
+    int64_t bc_top_type, double bc_top_cp, double bc_top_cs, double bc_top_rho,
+    double x_min, double x_max, double precision, int64_t max_modes) {
+
+  const double *b1 = B1.data_ptr<double>();
+  const int64_t n_layers = layer_loc_t.size(0);
+  const int64_t *ll = layer_loc_t.data_ptr<int64_t>();
+  const int64_t *ln = layer_n_t.data_ptr<int64_t>();
+  const double *lh = layer_h_t.data_ptr<double>();
+  const double *lr = layer_rho_t.data_ptr<double>();
+
+  AcousticBC bc_bot = {(int)bc_bot_type, bc_bot_cp, bc_bot_cs, bc_bot_rho};
+  AcousticBC bc_top = {(int)bc_top_type, bc_top_cp, bc_top_cs, bc_top_rho};
+
+  // Mode counting at interval endpoints
+  auto r_min = dispersion_eval(x_min, b1, n_layers, ll, ln, lh, lr, omega2,
+                               bc_bot, bc_top, true, 0, nullptr);
+  auto r_max = dispersion_eval(x_max, b1, n_layers, ll, ln, lh, lr, omega2,
+                               bc_bot, bc_top, true, 0, nullptr);
+
+  int64_t M = r_min.mode_count - r_max.mode_count;
+  if (M <= 0 || M > max_modes)
+    M = std::min(M, max_modes);
+  if (M <= 0) {
+    return std::make_tuple(torch::empty({0}, torch::kFloat64), (int64_t)0);
+  }
+
+  // Bisection bracketing
+  std::vector<double> x_l(M, x_min), x_r(M, x_max);
+  std::unordered_map<int64_t, int64_t> mc_cache;
+
+  auto get_mc = [&](double x) -> int64_t {
+    int64_t key = (int64_t)(x * 1e15);
+    auto it = mc_cache.find(key);
+    if (it != mc_cache.end())
+      return it->second;
+    auto r = dispersion_eval(x, b1, n_layers, ll, ln, lh, lr, omega2, bc_bot,
+                             bc_top, true, 0, nullptr);
+    mc_cache[key] = r.mode_count;
+    return r.mode_count;
+  };
+
+  int64_t mc_min_val = r_min.mode_count;
+
+  for (int64_t iter = 0; iter < 50 * M; ++iter) {
+    bool all_isolated = true;
+    for (int64_t j = 0; j < M; ++j) {
+      int64_t target = mc_min_val - j - 1;
+      if (x_r[j] - x_l[j] < 1e-20 * std::abs(x_l[j]))
+        continue;
+      double x_mid = 0.5 * (x_l[j] + x_r[j]);
+      int64_t mc_mid = get_mc(x_mid);
+      if (mc_mid > target)
+        x_l[j] = x_mid;
+      else
+        x_r[j] = x_mid;
+      if (x_r[j] - x_l[j] > 1e-14 * std::abs(x_l[j]))
+        all_isolated = false;
+    }
+    if (all_isolated)
+      break;
+  }
+
+  // Brent polish for each mode
+  auto eigenvalues = torch::empty({M}, torch::kFloat64);
+  double *ev = eigenvalues.data_ptr<double>();
+
+  for (int64_t mode = 0; mode < M; ++mode) {
+    double eps = std::abs(x_r[mode]) * std::pow(10.0, 2.0 - precision);
+    ev[mode] = zbrent_cpp(b1, n_layers, ll, ln, lh, lr, omega2, bc_bot, bc_top,
+                          x_l[mode], x_r[mode], eps, mode, ev);
+  }
+
+  return std::make_tuple(eigenvalues, M);
+}
+
+// Full solve2: secant with Richardson-extrapolated initial guesses.
+std::tuple<torch::Tensor, int64_t>
+acoustic_solve2(torch::Tensor B1, torch::Tensor layer_loc_t,
+                torch::Tensor layer_n_t, torch::Tensor layer_h_t,
+                torch::Tensor layer_rho_t, double omega2, int64_t bc_bot_type,
+                double bc_bot_cp, double bc_bot_cs, double bc_bot_rho,
+                int64_t bc_top_type, double bc_top_cp, double bc_top_cs,
+                double bc_top_rho, torch::Tensor prev_eigenvalues, int64_t M,
+                double precision, double c_high) {
+
+  const double *b1 = B1.data_ptr<double>();
+  const int64_t n_layers = layer_loc_t.size(0);
+  const int64_t *ll = layer_loc_t.data_ptr<int64_t>();
+  const int64_t *ln = layer_n_t.data_ptr<int64_t>();
+  const double *lh = layer_h_t.data_ptr<double>();
+  const double *lr = layer_rho_t.data_ptr<double>();
+
+  AcousticBC bc_bot = {(int)bc_bot_type, bc_bot_cp, bc_bot_cs, bc_bot_rho};
+  AcousticBC bc_top = {(int)bc_top_type, bc_top_cp, bc_top_cs, bc_top_rho};
+
+  auto eigenvalues = torch::empty({M}, torch::kFloat64);
+  double *ev = eigenvalues.data_ptr<double>();
+  const double *prev_ev = prev_eigenvalues.data_ptr<double>();
+
+  int64_t n_total = 0;
+  for (int64_t i = 0; i < n_layers; ++i)
+    n_total += ln[i];
+
+  for (int64_t mode = 0; mode < M; ++mode) {
+    double x_init = prev_ev[mode];
+    double tol =
+        std::abs(x_init) * (double)n_total * std::pow(10.0, 1.0 - precision);
+
+    ev[mode] = secant_cpp(b1, n_layers, ll, ln, lh, lr, omega2, bc_bot, bc_top,
+                          x_init, tol, mode, ev);
+
+    if (omega2 / (c_high * c_high) > ev[mode]) {
+      return std::make_tuple(eigenvalues.slice(0, 0, mode), mode);
+    }
+  }
+
+  return std::make_tuple(eigenvalues, M);
+}
+
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -726,4 +1110,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("solve_tridiag_batch", &solve_tridiag_batch);
   m.def("acoustic_recurrence_scalar_counted",
         &acoustic_recurrence_scalar_counted);
+  m.def("acoustic_solve1", &acoustic_solve1);
+  m.def("acoustic_solve2", &acoustic_solve2);
 }

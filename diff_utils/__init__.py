@@ -6,6 +6,14 @@ from .acoustic_recurrence import (
     acoustic_recurrence_nograd,
     acoustic_recurrence_scalar_counted,
 )
+from .acoustic_solver import (
+    acoustic_solve1,
+    acoustic_solve2,
+    BC_VACUUM,
+    BC_RIGID,
+    BC_ACOUSTIC,
+    BC_ELASTIC,
+)
 from .solve_tridiag import (
     solve_tridiag,
     solve_tridiag_batch,
@@ -51,6 +59,12 @@ __all__ = [
     "solve_tridiag_batch",
     "tridiag_inverse_iteration",
     "tridiag_inverse_iteration_batch",
+    "acoustic_solve1",
+    "acoustic_solve2",
+    "BC_VACUUM",
+    "BC_RIGID",
+    "BC_ACOUSTIC",
+    "BC_ELASTIC",
     "SearchsortedLerpFn",
     "searchsorted_lerp",
     "interp_batch",
