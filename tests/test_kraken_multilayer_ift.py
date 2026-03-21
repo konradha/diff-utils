@@ -35,7 +35,6 @@ def _pekeris_2layer(
 
 
 def _halfspace_bc(x_val, omega2, c_bot=2000.0, rho_bot=2.0):
-
     gamma2 = x_val - omega2 / c_bot**2
     if gamma2 > 0:
         f = gamma2**0.5

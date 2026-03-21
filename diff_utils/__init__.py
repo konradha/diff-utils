@@ -1,6 +1,17 @@
 from .logdet import BandedLogDet, banded_logdet, dense_to_lapack_band, lapack_band_to_dense
 from .solve_banded import make_banded_csr, solve_banded, solve_banded_csr_values
-from .acoustic_recurrence import AcousticRecurrenceFn, acoustic_recurrence
+from .acoustic_recurrence import (
+    AcousticRecurrenceFn,
+    acoustic_recurrence,
+    acoustic_recurrence_nograd,
+    acoustic_recurrence_scalar_counted,
+)
+from .solve_tridiag import (
+    solve_tridiag,
+    solve_tridiag_batch,
+    tridiag_inverse_iteration,
+    tridiag_inverse_iteration_batch,
+)
 from .interp import SearchsortedLerpFn, searchsorted_lerp, interp_batch
 from .trapezoidal_dot import (
     TrapezoidalMultiLayerNormFn,
@@ -34,6 +45,12 @@ __all__ = [
     "solve_banded_csr_values",
     "AcousticRecurrenceFn",
     "acoustic_recurrence",
+    "acoustic_recurrence_nograd",
+    "acoustic_recurrence_scalar_counted",
+    "solve_tridiag",
+    "solve_tridiag_batch",
+    "tridiag_inverse_iteration",
+    "tridiag_inverse_iteration_batch",
     "SearchsortedLerpFn",
     "searchsorted_lerp",
     "interp_batch",

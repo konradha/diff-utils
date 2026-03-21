@@ -13,3 +13,5 @@ demo/*
 benchmarks/*
 docs/*
 artifacts/*
+experimental/*
+tests/experimental/*

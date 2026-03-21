@@ -126,4 +126,51 @@ def acoustic_recurrence(
     return f_num, g_val
 
 
-__all__ = ["AcousticRecurrenceFn", "acoustic_recurrence"]
+def acoustic_recurrence_nograd(
+    B1: torch.Tensor,
+    h2k2: torch.Tensor,
+    loc_start: int,
+    loc_end: int,
+    p1_init: torch.Tensor,
+    p2_init: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ext = _cpu_ext()
+    if ext is None:
+        raise RuntimeError("C++ extension required for acoustic_recurrence")
+    return ext.acoustic_recurrence_fwd(
+        B1.contiguous(),
+        h2k2.contiguous(),
+        loc_start,
+        loc_end,
+        p1_init.contiguous(),
+        p2_init.contiguous(),
+    )
+
+
+def acoustic_recurrence_scalar_counted(
+    B1: torch.Tensor,
+    h2k2: float,
+    loc_start: int,
+    loc_end: int,
+    p1_init: float,
+    p2_init: float,
+) -> tuple[float, float, int]:
+    ext = _cpu_ext()
+    if ext is None:
+        raise RuntimeError("C++ extension required")
+    return ext.acoustic_recurrence_scalar_counted(
+        B1.contiguous(),
+        h2k2,
+        loc_start,
+        loc_end,
+        p1_init,
+        p2_init,
+    )
+
+
+__all__ = [
+    "AcousticRecurrenceFn",
+    "acoustic_recurrence",
+    "acoustic_recurrence_nograd",
+    "acoustic_recurrence_scalar_counted",
+]

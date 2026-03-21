@@ -581,7 +581,6 @@ searchsorted_lerp_fwd(torch::Tensor z_knots, torch::Tensor values,
   return std::make_tuple(out, idx, weights);
 }
 
-// scatter-add grad to values
 torch::Tensor searchsorted_lerp_bwd(torch::Tensor grad_out, torch::Tensor idx,
                                     torch::Tensor weights, int64_t n_knots) {
   const int64_t m = grad_out.size(0);
@@ -607,6 +606,110 @@ torch::Tensor searchsorted_lerp_bwd(torch::Tensor grad_out, torch::Tensor idx,
   return grad_values;
 }
 
+torch::Tensor solve_tridiag(torch::Tensor dl, torch::Tensor d, torch::Tensor du,
+                            torch::Tensor b) {
+  TORCH_CHECK(dl.device().is_cpu() && d.device().is_cpu() &&
+                  du.device().is_cpu() && b.device().is_cpu(),
+              "all inputs must be on CPU");
+  const int64_t N = d.size(0);
+  TORCH_CHECK(dl.size(0) == N - 1, "dl must have N-1 elements");
+  TORCH_CHECK(du.size(0) == N - 1, "du must have N-1 elements");
+  TORCH_CHECK(b.size(0) == N, "b must have N elements");
+
+  auto d_w = d.contiguous().clone();
+  auto x = b.contiguous().clone();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kComplexFloat, at::kComplexDouble, d.scalar_type(), "solve_tridiag",
+      [&] {
+        scalar_t *RESTRICT dw = d_w.data_ptr<scalar_t>();
+        scalar_t *RESTRICT xp = x.data_ptr<scalar_t>();
+        const scalar_t *RESTRICT dlp = dl.data_ptr<scalar_t>();
+        const scalar_t *RESTRICT dup = du.data_ptr<scalar_t>();
+
+        for (int64_t i = 1; i < N; ++i) {
+          scalar_t w = dlp[i - 1] / dw[i - 1];
+          dw[i] -= w * dup[i - 1];
+          xp[i] -= w * xp[i - 1];
+        }
+        xp[N - 1] /= dw[N - 1];
+        for (int64_t i = N - 2; i >= 0; --i) {
+          xp[i] = (xp[i] - dup[i] * xp[i + 1]) / dw[i];
+        }
+      });
+
+  return x;
+}
+
+torch::Tensor solve_tridiag_batch(torch::Tensor dl, torch::Tensor d_batch,
+                                  torch::Tensor du, torch::Tensor b_batch) {
+  TORCH_CHECK(d_batch.dim() == 2 && b_batch.dim() == 2, "d_batch/b_batch 2D");
+  const int64_t M = d_batch.size(0);
+  const int64_t N = d_batch.size(1);
+  TORCH_CHECK(dl.size(0) == N - 1 && du.size(0) == N - 1, "dl/du size");
+  TORCH_CHECK(b_batch.size(0) == M && b_batch.size(1) == N, "b_batch size");
+
+  auto d_w = d_batch.contiguous().clone();
+  auto x = b_batch.contiguous().clone();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kComplexFloat, at::kComplexDouble, d_batch.scalar_type(),
+      "solve_tridiag_batch", [&] {
+        scalar_t *RESTRICT dw = d_w.data_ptr<scalar_t>();
+        scalar_t *RESTRICT xp = x.data_ptr<scalar_t>();
+        const scalar_t *RESTRICT dlp = dl.data_ptr<scalar_t>();
+        const scalar_t *RESTRICT dup = du.data_ptr<scalar_t>();
+
+        at::parallel_for(0, M, 1, [&](int64_t m0, int64_t m1) {
+          for (int64_t m = m0; m < m1; ++m) {
+            scalar_t *RESTRICT dm = dw + m * N;
+            scalar_t *RESTRICT xm = xp + m * N;
+            for (int64_t i = 1; i < N; ++i) {
+              scalar_t w = dlp[i - 1] / dm[i - 1];
+              dm[i] -= w * dup[i - 1];
+              xm[i] -= w * xm[i - 1];
+            }
+            xm[N - 1] /= dm[N - 1];
+            for (int64_t i = N - 2; i >= 0; --i) {
+              xm[i] = (xm[i] - dup[i] * xm[i + 1]) / dm[i];
+            }
+          }
+        });
+      });
+
+  return x;
+}
+
+std::tuple<double, double, int64_t>
+acoustic_recurrence_scalar_counted(torch::Tensor B1, double h2k2,
+                                   int64_t loc_start, int64_t loc_end,
+                                   double p1_init, double p2_init) {
+  TORCH_CHECK(B1.device().is_cpu() && B1.dim() == 1, "B1 must be 1D CPU");
+  TORCH_CHECK(loc_end >= loc_start, "loc_end >= loc_start");
+
+  const int64_t sweep_len = loc_end - loc_start + 1;
+  const double *RESTRICT b1 = B1.data_ptr<double>();
+
+  double p0 = p1_init;
+  double p1 = p1_init;
+  double p2 = p2_init;
+  int64_t mode_count = 0;
+
+  for (int64_t s = 0; s < sweep_len; ++s) {
+    int64_t jj = loc_end - s;
+    p0 = p1;
+    p1 = p2;
+    p2 = (h2k2 - b1[jj]) * p1 - p0;
+    if (p0 * p1 <= 0.0 && p0 != 0.0) {
+      ++mode_count;
+    }
+  }
+
+  double f_num = -(p2 - p0);
+  double g_val = -p1;
+  return std::make_tuple(f_num, g_val, mode_count);
+}
+
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -619,4 +722,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("acoustic_recurrence_bwd", &acoustic_recurrence_bwd);
   m.def("searchsorted_lerp_fwd", &searchsorted_lerp_fwd);
   m.def("searchsorted_lerp_bwd", &searchsorted_lerp_bwd);
+  m.def("solve_tridiag", &solve_tridiag);
+  m.def("solve_tridiag_batch", &solve_tridiag_batch);
+  m.def("acoustic_recurrence_scalar_counted",
+        &acoustic_recurrence_scalar_counted);
 }
