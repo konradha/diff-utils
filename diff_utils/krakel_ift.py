@@ -1,4 +1,3 @@
-"""KRAKEL eigenvalue IFT via banded logdet dispersion."""
 from __future__ import annotations
 
 from typing import Callable

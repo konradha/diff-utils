@@ -7,7 +7,6 @@ import subprocess
 _CPU_EXT = None
 _CPU_EXT_FAILED = False
 
-
 def _cpu_ext():
     global _CPU_EXT, _CPU_EXT_FAILED
     if _CPU_EXT is None and not _CPU_EXT_FAILED:
@@ -77,7 +76,6 @@ def _cpu_ext():
             os.environ.clear()
             os.environ.update(backup)
     return _CPU_EXT
-
 
 def _tensor_has_storage(x) -> bool:
     try:

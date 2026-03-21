@@ -8,7 +8,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from diff_utils.eigenvector_gate import tridiag_eigvec_reattach
+from diff_utils.eigvec_adjoint import tridiag_eigvec_reattach
 
 
 def _build_tridiag_dense(d, e):

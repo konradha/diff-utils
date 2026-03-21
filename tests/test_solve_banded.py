@@ -22,7 +22,6 @@ def _rand_diags(
     dtype: torch.dtype,
     seed: int,
 ) -> Dict[int, torch.Tensor]:
-    """Create diagonally dominant banded diagonals so A is nonsingular."""
     g = torch.Generator().manual_seed(seed)
     diags: Dict[int, torch.Tensor] = {}
     abs_sum = torch.zeros(n, dtype=_real_dtype(dtype))
@@ -64,7 +63,6 @@ def _real_dtype(dtype: torch.dtype) -> torch.dtype:
 
 
 def _scipy_ab_from_diags(diags: Dict[int, torch.Tensor], n: int, kl: int, ku: int) -> np.ndarray:
-    """Map diagonal dictionary to SciPy solve_banded storage."""
     ab = np.zeros((kl + ku + 1, n), dtype=np.asarray(diags[0].cpu()).dtype)
     for d, v in diags.items():
         arr = np.asarray(v.detach().cpu())
@@ -79,7 +77,6 @@ def _scipy_ab_from_diags(diags: Dict[int, torch.Tensor], n: int, kl: int, ku: in
 def _assert_residual_small(
     A: torch.Tensor, x: torch.Tensor, b: torch.Tensor, tol: float = 1e-8
 ) -> None:
-    """Check ||Ax-b|| is small, handling vector/multi-RHS and batched shapes."""
     dense_A = A.to_dense()
     if b.dim() == 1:
         r = dense_A @ x - b
@@ -121,7 +118,6 @@ def _from_b3(t3: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
 
 
 def test_correctness_tridiagonal_against_scipy_float64() -> None:
-    """Verifies solve_banded matches SciPy for a real tridiagonal system."""
     n = 64
     diags = _rand_diags(n, 1, 1, dtype=torch.float64, seed=0)
     A = make_banded_csr(diags, n)
@@ -134,7 +130,6 @@ def test_correctness_tridiagonal_against_scipy_float64() -> None:
 
 
 def test_correctness_general_banded_against_scipy_float64() -> None:
-    """Verifies solve_banded matches SciPy for a real general banded system (kl=2, ku=3)."""
     n = 80
     kl, ku = 2, 3
     diags = _rand_diags(n, kl, ku, dtype=torch.float64, seed=1)
@@ -148,7 +143,6 @@ def test_correctness_general_banded_against_scipy_float64() -> None:
 
 
 def test_correctness_complex128_against_scipy() -> None:
-    """Verifies complex solve matches SciPy for a complex128 tridiagonal system."""
     n = 48
     diags = _rand_diags(n, 1, 1, dtype=torch.complex128, seed=2)
     A = make_banded_csr(diags, n)
@@ -162,7 +156,6 @@ def test_correctness_complex128_against_scipy() -> None:
 
 
 def test_correctness_multiple_rhs_shape() -> None:
-    """Verifies linearity and shape preservation for multiple RHS with shape (N, rhs)."""
     n, rhs = 40, 4
     diags = _rand_diags(n, 1, 1, dtype=torch.float64, seed=3)
     A = make_banded_csr(diags, n)
@@ -174,7 +167,6 @@ def test_correctness_multiple_rhs_shape() -> None:
 
 
 def test_correctness_batch_shape() -> None:
-    """Verifies independent solves across a batch of RHS vectors with shape (batch, N)."""
     n, batch = 30, 5
     diags = _rand_diags(n, 2, 1, dtype=torch.float64, seed=4)
     A = make_banded_csr(diags, n)
@@ -186,7 +178,6 @@ def test_correctness_batch_shape() -> None:
 
 
 def test_correctness_batch_multiple_rhs_shape() -> None:
-    """Verifies batched multi-RHS solves with shape (batch, N, rhs)."""
     n, batch, rhs = 28, 3, 2
     diags = _rand_diags(n, 1, 2, dtype=torch.float64, seed=5)
     A = make_banded_csr(diags, n)
@@ -213,7 +204,6 @@ def test_gradcheck_values_real_multiple_bandwidths(kl: int, ku: int, seed: int) 
 
 
 def test_gradcheck_values_tridiagonal_complex() -> None:
-    """Verifies Wirtinger VJP wrt CSR values for a complex tridiagonal system."""
     n = 8
     diags = _rand_diags(n, 1, 1, dtype=torch.complex128, seed=7)
     A = make_banded_csr(diags, n)
@@ -230,7 +220,6 @@ def test_gradcheck_values_tridiagonal_complex() -> None:
 
 
 def test_gradcheck_b_real() -> None:
-    """Verifies VJP wrt b for a real system equals finite-difference Jacobian."""
     n = 9
     diags = _rand_diags(n, 1, 1, dtype=torch.float64, seed=8)
     A = make_banded_csr(diags, n)
@@ -243,7 +232,6 @@ def test_gradcheck_b_real() -> None:
 
 
 def test_gradcheck_b_complex() -> None:
-    """Verifies VJP wrt b for a complex system using Wirtinger finite-difference checks."""
     n = 9
     diags = _rand_diags(n, 1, 1, dtype=torch.complex128, seed=9)
     A = make_banded_csr(diags, n)
@@ -272,7 +260,6 @@ def test_gradcheck_b_real_multiple_bandwidths(kl: int, ku: int, seed: int) -> No
 
 
 def test_gradcheck_batched_case() -> None:
-    """Verifies gradients for batched RHS solves share the same analytical VJP as unbatched solves."""
     n, batch = 8, 3
     diags = _rand_diags(n, 1, 1, dtype=torch.float64, seed=11)
     A = make_banded_csr(diags, n)
@@ -285,7 +272,6 @@ def test_gradcheck_batched_case() -> None:
 
 
 def test_gradcheck_double_backward_create_graph() -> None:
-    """Verifies create_graph=True enables finite, non-null second derivatives."""
     n = 7
     diags = _rand_diags(n, 1, 1, dtype=torch.float64, seed=12)
     A = make_banded_csr(diags, n)
@@ -305,7 +291,6 @@ def test_gradcheck_double_backward_create_graph() -> None:
 
 @pytest.mark.parametrize("kl,ku,seed", [(0, 2, 41), (1, 1, 42), (2, 3, 43)])
 def test_backward_vjp_formula_real_multiple_bandwidths(kl: int, ku: int, seed: int) -> None:
-    """Verifies real VJP formulas b_bar=A^{-T}x_bar and values_bar=-(b_bar[row]*x[col]) for multiple bandwidths."""
     n, batch, rhs = 18, 3, 2
     diags = _rand_diags(n, kl, ku, dtype=torch.float64, seed=seed)
     A = make_banded_csr(diags, n)
@@ -337,7 +322,7 @@ def test_backward_vjp_formula_real_multiple_bandwidths(kl: int, ku: int, seed: i
 
 @pytest.mark.parametrize("kl,ku,seed", [(1, 1, 44), (2, 1, 45)])
 def test_backward_vjp_formula_complex_multiple_bandwidths(kl: int, ku: int, seed: int) -> None:
-    """Verifies complex Wirtinger VJP formulas b_bar=A^{-H}x_bar and values_bar=-conj(b_bar[row])*conj(x[col])."""
+    #b_bar=A^{-H}x_bar and values_bar=-conj(b_bar[row])*conj(x[col])
     n, batch, rhs = 16, 2, 3
     diags = _rand_diags(n, kl, ku, dtype=torch.complex128, seed=seed)
     A = make_banded_csr(diags, n)
@@ -376,7 +361,6 @@ def test_backward_vjp_formula_complex_multiple_bandwidths(kl: int, ku: int, seed
 
 @pytest.mark.parametrize("kl,ku,seed", [(1, 1, 46), (2, 3, 47)])
 def test_backward_matches_dense_autograd_values_and_b(kl: int, ku: int, seed: int) -> None:
-    """Verifies gradients wrt sparse CSR values and RHS match dense torch.linalg.solve autograd."""
     n, rhs = 14, 3
     diags = _rand_diags(n, kl, ku, dtype=torch.float64, seed=seed)
     A = make_banded_csr(diags, n)
@@ -403,7 +387,6 @@ def test_backward_matches_dense_autograd_values_and_b(kl: int, ku: int, seed: in
 
 @pytest.mark.parametrize("kl,ku,seed", [(1, 1, 48), (2, 3, 49)])
 def test_double_backward_create_graph_multiple_bandwidths(kl: int, ku: int, seed: int) -> None:
-    """Verifies second-order derivatives are finite for values and b across multiple bandwidths."""
     n = 7
     diags = _rand_diags(n, kl, ku, dtype=torch.float64, seed=seed)
     A = make_banded_csr(diags, n)
@@ -420,7 +403,6 @@ def test_double_backward_create_graph_multiple_bandwidths(kl: int, ku: int, seed
 
 
 def test_edge_case_n1_scalar_system() -> None:
-    """Verifies the solver reduces to scalar division when N=1."""
     A = make_banded_csr({0: torch.tensor([2.5], dtype=torch.float64)}, 1)
     b = torch.tensor([5.0], dtype=torch.float64)
     x = solve_banded(A, b, 0, 0)
@@ -428,7 +410,6 @@ def test_edge_case_n1_scalar_system() -> None:
 
 
 def test_edge_case_triangular_matches_solve_triangular() -> None:
-    """Verifies one-sided bandwidth systems match torch.linalg.solve_triangular exactly."""
     n = 16
 
     diags_l = _rand_diags(n, 2, 0, dtype=torch.float64, seed=13)
@@ -456,7 +437,6 @@ def test_edge_case_singular_system_tolerated() -> None:
 
 
 def test_edge_case_diagonal_dominant_stability() -> None:
-    """Verifies diagonally dominant systems have small residual and stable solve behavior."""
     n = 128
     diags = _rand_diags(n, 1, 1, dtype=torch.float64, seed=15)
     A = make_banded_csr(diags, n)
@@ -467,7 +447,6 @@ def test_edge_case_diagonal_dominant_stability() -> None:
 
 
 def test_edge_case_bandwidth_exceeds_matrix_size_error() -> None:
-    """Verifies invalid bandwidth (kl+ku+1>N) is rejected."""
     n = 4
     d0 = torch.ones(n, dtype=torch.float64)
     A = make_banded_csr({0: d0}, n)
@@ -478,7 +457,6 @@ def test_edge_case_bandwidth_exceeds_matrix_size_error() -> None:
 
 @pytest.mark.performance
 def test_performance_vs_dense_reports_speedup() -> None:
-    """Benchmarks tridiagonal solve against dense solve and reports empirical speedup."""
     if os.getenv("RUN_PERF_TESTS", "0") != "1":
         pytest.skip("Set RUN_PERF_TESTS=1 to run performance tests")
 
@@ -516,7 +494,6 @@ def test_performance_vs_dense_reports_speedup() -> None:
 
 @pytest.mark.performance
 def test_performance_empirical_linear_scaling() -> None:
-    """Verifies approximately O(N) scaling for tridiagonal solves by timing across N."""
     if os.getenv("RUN_PERF_TESTS", "0") != "1":
         pytest.skip("Set RUN_PERF_TESTS=1 to run performance tests")
 
@@ -544,7 +521,7 @@ def test_performance_empirical_linear_scaling() -> None:
 
 
 def test_vmap_over_batch_dimension_of_b() -> None:
-    """Verifies vmapping RHS vectors is equivalent to explicit looped solves with fixed A."""
+    
     n, batch = 24, 6
     diags = _rand_diags(n, 1, 1, dtype=torch.float64, seed=16)
     A = make_banded_csr(diags, n)
@@ -556,7 +533,6 @@ def test_vmap_over_batch_dimension_of_b() -> None:
 
 
 def test_vmap_over_batch_dimension_of_A_values() -> None:
-    """Verifies vmapping over CSR values (batched A) matches looped solves with fixed b."""
     n, batch = 24, 4
     diags = _rand_diags(n, 1, 1, dtype=torch.float64, seed=17)
     A0 = make_banded_csr(diags, n)
@@ -574,7 +550,6 @@ def test_vmap_over_batch_dimension_of_A_values() -> None:
 
 
 def test_nested_vmap() -> None:
-    """Verifies nested vmap composition agrees with nested explicit loops."""
     n, batch_a, batch_b = 16, 3, 5
     diags = _rand_diags(n, 1, 1, dtype=torch.float64, seed=18)
     A0 = make_banded_csr(diags, n)

@@ -59,7 +59,6 @@ def _assert_slogdet_match(A_band: torch.Tensor, kl: int, ku: int, rtol: float = 
 @pytest.mark.parametrize("n", [5, 10, 20, 50])
 @pytest.mark.parametrize("kl,ku", [(1, 1), (2, 2), (4, 4), (2, 3), (3, 1)])
 def test_dense_comparison_random_banded(n: int, kl: int, ku: int) -> None:
-    """Verifies signed log-determinant matches dense slogdet for random banded matrices."""
     A_dense = _random_banded_dense(n, kl, ku, seed=11 + 7 * n + 3 * kl + ku)
     A_band = dense_to_lapack_band(A_dense, kl, ku)
     _assert_slogdet_match(A_band, kl, ku)
@@ -68,7 +67,6 @@ def test_dense_comparison_random_banded(n: int, kl: int, ku: int) -> None:
 @pytest.mark.parametrize("n", [5, 8, 12])
 @pytest.mark.parametrize("kl,ku", [(1, 1), (2, 2), (4, 4), (1, 3), (3, 1)])
 def test_gradcheck_band_storage(n: int, kl: int, ku: int) -> None:
-    """Verifies first-order gradient of logabsdet wrt LAPACK band storage by finite differences."""
     A_dense = _random_banded_dense(n, kl, ku, seed=100 + 13 * n + kl + ku)
     A_band = dense_to_lapack_band(A_dense, kl, ku).requires_grad_(True)
 
@@ -79,7 +77,6 @@ def test_gradcheck_band_storage(n: int, kl: int, ku: int) -> None:
 
 
 def test_near_singular_forward_and_backward_stability() -> None:
-    """Verifies near-singular systems produce very negative logabsdet and finite backward gradients."""
     n, kl, ku = 24, 2, 2
     A = _random_banded_dense(n, kl, ku, seed=203)
     A[7, 7] = 1e-15
@@ -92,7 +89,6 @@ def test_near_singular_forward_and_backward_stability() -> None:
 
 
 def test_known_identity_determinant() -> None:
-    """Verifies identity matrix gives sign=1 and logabsdet=0 exactly."""
     n, kl, ku = 12, 4, 4
     A = torch.eye(n, dtype=torch.float64)
     A_band = dense_to_lapack_band(A, kl, ku)
@@ -102,7 +98,6 @@ def test_known_identity_determinant() -> None:
 
 
 def test_known_diagonal_determinant() -> None:
-    """Verifies diagonal matrix determinant equals product of diagonal signs and log-magnitudes."""
     diag = torch.tensor([2.0, -3.0, 0.5, -4.0, 1.5], dtype=torch.float64)
     A = torch.diag(diag)
     A_band = dense_to_lapack_band(A, 0, 0)
@@ -114,7 +109,6 @@ def test_known_diagonal_determinant() -> None:
 
 
 def test_negative_determinant_sign() -> None:
-    """Verifies negative determinant matrices return sign=-1 and correct log|det|."""
     A = torch.diag(torch.tensor([1.0, -2.0, 3.0, 4.0], dtype=torch.float64))
     A_band = dense_to_lapack_band(A, 0, 0)
     sign, logabs = banded_logdet(A_band, 0, 0)
@@ -123,7 +117,6 @@ def test_negative_determinant_sign() -> None:
 
 
 def test_permutation_stress_sign_matches_dense() -> None:
-    """Verifies pivot-heavy tridiagonal cases still return the correct determinant sign."""
     n = 40
     A = torch.zeros((n, n), dtype=torch.float64)
     A[torch.arange(n), torch.arange(n)] = 1e-8
@@ -134,7 +127,6 @@ def test_permutation_stress_sign_matches_dense() -> None:
 
 
 def test_zero_matrix_returns_zero_sign_negative_infinity_and_zero_grad() -> None:
-    """Verifies exact singular zero matrix maps to (sign=0, logabsdet=-inf) and zero gradient."""
     n, kl, ku = 16, 2, 3
     A_band = torch.zeros((2 * kl + ku + 1, n), dtype=torch.float64, requires_grad=True)
     sign, logabs = banded_logdet(A_band, kl, ku)
@@ -145,7 +137,6 @@ def test_zero_matrix_returns_zero_sign_negative_infinity_and_zero_grad() -> None
 
 
 def test_huge_condition_number_forward_matches_dense() -> None:
-    """Verifies high-condition-number diagonal systems still return correct signed log-determinants."""
     n = 20
     diag = torch.logspace(-8, 8, n, dtype=torch.float64)
     A = torch.diag(diag)
@@ -154,7 +145,6 @@ def test_huge_condition_number_forward_matches_dense() -> None:
 
 
 def test_n1_degenerate_case() -> None:
-    """Verifies the 1x1 case computes sign and logabsdet correctly."""
     A = torch.tensor([[3.5]], dtype=torch.float64)
     A_band = dense_to_lapack_band(A, 1, 1)
     sign, logabs = banded_logdet(A_band, 1, 1)
@@ -163,7 +153,6 @@ def test_n1_degenerate_case() -> None:
 
 
 def test_bandwidth_exceeds_matrix_size_is_handled() -> None:
-    """Verifies n=2 with kl=ku=4 is accepted and still matches dense slogdet."""
     A = torch.tensor([[2.0, -1.0], [0.5, 3.0]], dtype=torch.float64)
     A_band = dense_to_lapack_band(A, 4, 4)
     _assert_slogdet_match(A_band, 4, 4)
@@ -171,7 +160,6 @@ def test_bandwidth_exceeds_matrix_size_is_handled() -> None:
 
 @pytest.mark.performance
 def test_forward_benchmark_wrapper_overhead() -> None:
-    """Benchmarks forward wrapper overhead against raw dgbtrf+diag extraction across sizes."""
     if os.getenv("RUN_PERF_TESTS", "0") != "1":
         pytest.skip("Set RUN_PERF_TESTS=1 to run performance tests")
 
@@ -207,7 +195,6 @@ def test_forward_benchmark_wrapper_overhead() -> None:
 
 @pytest.mark.performance
 def test_backward_benchmark_and_crossover() -> None:
-    """Benchmarks backward runtime and reports when it exceeds 10x forward runtime."""
     if os.getenv("RUN_PERF_TESTS", "0") != "1":
         pytest.skip("Set RUN_PERF_TESTS=1 to run performance tests")
 
@@ -240,7 +227,6 @@ def test_backward_benchmark_and_crossover() -> None:
 
 @pytest.mark.performance
 def test_memory_benchmark_backward_peak() -> None:
-    """Measures Python-tracked peak memory during backward for a large banded system."""
     if os.getenv("RUN_PERF_TESTS", "0") != "1":
         pytest.skip("Set RUN_PERF_TESTS=1 to run performance tests")
 
@@ -261,7 +247,6 @@ def test_memory_benchmark_backward_peak() -> None:
 
 @pytest.mark.performance
 def test_allocation_profiling_forward_backward() -> None:
-    """Profiles Python allocation deltas across one forward+backward call."""
     if os.getenv("RUN_PERF_TESTS", "0") != "1":
         pytest.skip("Set RUN_PERF_TESTS=1 to run performance tests")
 
@@ -285,7 +270,6 @@ def test_allocation_profiling_forward_backward() -> None:
 
 @pytest.mark.performance
 def test_repeated_forward_calls_inner_loop_overhead() -> None:
-    """Times repeated forward calls to estimate per-call overhead in root-finding style loops."""
     if os.getenv("RUN_PERF_TESTS", "0") != "1":
         pytest.skip("Set RUN_PERF_TESTS=1 to run performance tests")
 
@@ -303,9 +287,6 @@ def test_repeated_forward_calls_inner_loop_overhead() -> None:
     per_call_us = elapsed / reps * 1e6
     print("forward_per_call_us=", per_call_us)
     assert per_call_us < 250.0
-
-
-# ──────── Complex logdet tests ────────
 
 
 def _random_complex_banded_dense(n: int, kl: int, ku: int, seed: int) -> torch.Tensor:

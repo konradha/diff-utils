@@ -1,4 +1,3 @@
-"""Implicit function theorem for eigenvalue differentiation."""
 from __future__ import annotations
 
 from typing import Callable

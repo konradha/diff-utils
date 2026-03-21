@@ -1,4 +1,3 @@
-# Batched IFT backward for KRAKEN/KRAKENC eigenvalue diff
 
 from __future__ import annotations
 
@@ -6,7 +5,6 @@ import torch
 
 from diff_utils._ext import _cpu_ext, _tensor_has_storage
 from diff_utils.acoustic_recurrence import AcousticRecurrenceFn, _backward_python
-
 
 def _run_recurrence_bwd(
     grad_f_num,
@@ -47,13 +45,10 @@ def _run_recurrence_bwd(
         is_complex,
     )
 
-
 def _lorentz_inv(z: torch.Tensor, eps: float) -> torch.Tensor:
-    # z̄/(|z|² + ε²)
     if z.is_complex():
         return z.conj() / (z.real**2 + z.imag**2 + eps * eps)
     return z / (z * z + eps * eps)
-
 
 class KrakenEigenvalueIFT(torch.autograd.Function):
     @staticmethod
@@ -159,7 +154,6 @@ class KrakenEigenvalueIFT(torch.autograd.Function):
         f_interior = f_num / scale
         g_interior = g_val
 
-        # dispersion partials
         g_top = g_bc_top.detach()
         f_top = f_bc_top.detach()
 
@@ -179,11 +173,9 @@ class KrakenEigenvalueIFT(torch.autograd.Function):
             is_complex,
         )
 
-        # chain ICs
         grad_B1_delta[loc_end] += (grad_p2i_delta * g_bot).sum()
         grad_h2k2_delta += grad_p2i_delta * (-g_bot)
 
-        # dDelta/dx = interior via h2k2 + top BC + bottom BC via recurrence ICs.
         dp1_init_dx = -2.0 * dgdx_bot.detach()
         dp2_init_dx = (
             +(B1_end - h2k2) * dgdx_bot.detach() - 2.0 * h_med * rho_med * dfdx_bot.detach()
@@ -234,7 +226,6 @@ class KrakenEigenvalueIFT(torch.autograd.Function):
             None,
         )
 
-
 def kraken_eigenvalue_ift(
     x_converged: torch.Tensor,
     B1: torch.Tensor,
@@ -270,6 +261,5 @@ def kraken_eigenvalue_ift(
         dgdx_bot,
         eps,
     )
-
 
 __all__ = ["KrakenEigenvalueIFT", "kraken_eigenvalue_ift"]
