@@ -1,9 +1,4 @@
-from .logdet import (
-    BandedLogDet,
-    banded_logdet,
-    dense_to_lapack_band,
-    lapack_band_to_dense,
-)
+from .logdet import BandedLogDet, banded_logdet, dense_to_lapack_band, lapack_band_to_dense
 from .solve_banded import make_banded_csr, solve_banded, solve_banded_csr_values
 from .acoustic_recurrence import AcousticRecurrenceFn, acoustic_recurrence
 from .interp import SearchsortedLerpFn, searchsorted_lerp, interp_batch
@@ -13,16 +8,16 @@ from .trapezoidal_dot import (
     trapezoidal_multilayer_normalization,
     trapezoidal_normalization,
 )
-from .eigenvalue_gate import eigenvalue_gate
-from .eigenvector_gate import (
-    EigenvectorGateFn,
-    eigenvector_gate,
-    eigenvector_gate_degpert,
+from .eigenvalue_ift import eigenvalue_ift
+from .eigvec_adjoint import (
+    EigvecReattachFn,
+    eigvec_reattach,
+    eigvec_degpert,
     tridiag_eigvec_adjoint,
     tridiag_eigvec_reattach,
 )
 from .elastic_propagation import ElasticPropagationFn, elastic_propagation
-from .krakel_gate import krakel_eigenvalue_gate
+from .krakel_ift import krakel_eigenvalue_ift
 from .kraken_ift import KrakenEigenvalueIFT, kraken_eigenvalue_ift
 from .tridiag_eigh import tridiag_eigh
 from .mode_coupling import mode_coupling
@@ -46,15 +41,15 @@ __all__ = [
     "TrapezoidalNormFn",
     "trapezoidal_multilayer_normalization",
     "trapezoidal_normalization",
-    "eigenvalue_gate",
-    "EigenvectorGateFn",
-    "eigenvector_gate",
-    "eigenvector_gate_degpert",
+    "eigenvalue_ift",
+    "EigvecReattachFn",
+    "eigvec_reattach",
+    "eigvec_degpert",
     "tridiag_eigvec_adjoint",
     "tridiag_eigvec_reattach",
     "ElasticPropagationFn",
     "elastic_propagation",
-    "krakel_eigenvalue_gate",
+    "krakel_eigenvalue_ift",
     "KrakenEigenvalueIFT",
     "kraken_eigenvalue_ift",
     "tridiag_eigh",

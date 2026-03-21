@@ -4,7 +4,6 @@ from typing import List, Optional
 
 import torch
 
-
 def range_stepper(
     A0: torch.Tensor,
     k_segments: List[torch.Tensor],
@@ -18,7 +17,6 @@ def range_stepper(
         if C_interfaces is not None and i < len(C_interfaces):
             A = C_interfaces[i].T.to(torch.complex128) @ A.to(torch.complex128)
     return A
-
 
 def range_stepper_batched(
     A0: torch.Tensor,
@@ -45,7 +43,6 @@ def range_stepper_batched(
     r_prev = 0.0
 
     for seg in range(n_segments):
-        # bdry crossing
         if seg > 0 and N_b > 0:
             r_bnd = r_boundaries[seg - 1].item()
             dr_to_boundary = r_bnd - r_prev
@@ -77,6 +74,5 @@ def range_stepper_batched(
         A_out[:M_cur, idx] = A_at_receivers
 
     return A_out
-
 
 __all__ = ["range_stepper", "range_stepper_batched"]

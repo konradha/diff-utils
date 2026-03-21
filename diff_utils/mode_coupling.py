@@ -4,7 +4,6 @@ import torch
 
 from diff_utils.interp import searchsorted_lerp
 
-
 def mode_coupling(
     phi_left: torch.Tensor,
     phi_right: torch.Tensor,
@@ -36,10 +35,7 @@ def mode_coupling(
         w[1:-1] = (dz[:-1] + dz[1:]) / 2.0
     w_rho = (w / rho_common).to(torch.complex128)  # [N_c]
 
-    # C_mn = sum_z phi_L[m,z] * phi_R[n,z] * w/rho[z]
-    #      = phi_L @ diag(w/rho) @ phi_R^T
     C = phi_L_c @ (w_rho.unsqueeze(1) * phi_R_c.T)  # [M_L, M_R]
     return C
-
 
 __all__ = ["mode_coupling"]
