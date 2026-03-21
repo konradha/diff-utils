@@ -194,4 +194,96 @@ def eigenvector_gate_degpert(
     return grad_x, grad_d, grad_e
 
 
-__all__ = ["EigenvectorGateFn", "eigenvector_gate", "eigenvector_gate_degpert"]
+def tridiag_eigvec_adjoint(
+    phi: torch.Tensor,
+    d_vals: torch.Tensor,
+    e_vals: torch.Tensor,
+    grad_phi: torch.Tensor,
+    *,
+    tau: float = 1e-8,
+    eps: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # cluster aware degenerate perturbation eigenvector adjoint
+    from diff_utils.tridiag_eigh import tridiag_eigh
+
+    N = phi.shape[0]
+
+    # eigendecompose the tridiag
+    sigma, Q = tridiag_eigh(d_vals.detach(), e_vals.detach(), eps=eps)
+
+    # which tridiag eigenvalue corresponds to phi
+    overlaps = (Q.T @ phi.detach()).abs()
+    mode_idx = int(overlaps.argmax().item())
+    sigma_m = sigma[mode_idx]
+
+    diffs = (sigma - sigma_m).abs()
+    in_cluster = diffs < tau
+    in_cluster[mode_idx] = True  # always include the mode itself
+    cluster_idx = in_cluster.nonzero(as_tuple=True)[0]
+
+    # project gradient's nullspace
+    dot = torch.dot(phi.detach(), grad_phi)
+    g = grad_phi - dot * phi.detach()
+
+    g_hat = Q.T @ g  # [N]
+
+    diff_from_mode = sigma - sigma_m
+    lorentz = diff_from_mode / (diff_from_mode * diff_from_mode + eps * eps)
+    lambda_hat = g_hat * lorentz
+
+    lambda_hat[cluster_idx] = 0.0
+
+    lam = Q @ lambda_hat  # [N]
+
+    lam = lam - torch.dot(phi.detach(), lam) * phi.detach()
+
+    grad_d_out = -lam * phi.detach()
+    grad_e_out = -lam[:-1] * phi.detach()[1:] - lam[1:] * phi.detach()[:-1]
+
+    return grad_d_out, grad_e_out
+
+
+class TridiagEigvecAdjointFn(torch.autograd.Function):
+    @staticmethod
+    def forward(phi, d_vals, e_vals, tau, eps):
+        return phi.detach().clone()
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        phi, d_vals, e_vals, tau, eps = inputs
+        ctx.tau = tau
+        ctx.eps = eps
+        ctx.save_for_backward(phi, d_vals, e_vals)
+
+    @staticmethod
+    def backward(ctx, grad_phi):
+        phi, d_vals, e_vals = ctx.saved_tensors
+        grad_d, grad_e = tridiag_eigvec_adjoint(
+            phi,
+            d_vals,
+            e_vals,
+            grad_phi,
+            tau=ctx.tau,
+            eps=ctx.eps,
+        )
+        return None, grad_d, grad_e, None, None
+
+
+def tridiag_eigvec_reattach(
+    phi: torch.Tensor,
+    d_vals: torch.Tensor,
+    e_vals: torch.Tensor,
+    *,
+    tau: float = 1e-8,
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    return TridiagEigvecAdjointFn.apply(phi, d_vals, e_vals, tau, eps)
+
+
+__all__ = [
+    "EigenvectorGateFn",
+    "eigenvector_gate",
+    "eigenvector_gate_degpert",
+    "tridiag_eigvec_adjoint",
+    "tridiag_eigvec_reattach",
+]

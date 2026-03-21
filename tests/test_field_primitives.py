@@ -1,0 +1,153 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import torch
+from torch.autograd import gradcheck
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from diff_utils.mode_coupling import mode_coupling
+from diff_utils.range_stepper import range_stepper
+from diff_utils.interp import interp_batch, searchsorted_lerp
+from diff_utils.weighted_depth_integral import (
+    weighted_depth_integral,
+    weighted_depth_inner_product,
+)
+
+
+def test_mode_coupling_self():
+    N = 50
+    z = torch.linspace(0, 100, N, dtype=torch.float64)
+    phi = torch.stack([torch.sin(k * 3.14159 * z / 100) for k in range(1, 4)])
+    phi = phi / phi.norm(dim=1, keepdim=True)
+    rho = torch.ones(N, dtype=torch.float64)
+
+    C = mode_coupling(phi, phi, z, z, z, rho)
+    assert C.shape == (3, 3)
+    diag = C.real.diagonal()
+    assert torch.all(diag > 0.9)
+    off_diag = C.real - torch.diag(diag)
+    assert off_diag.abs().max() < 0.1
+
+
+def test_mode_coupling_shape():
+    z_l = torch.linspace(0, 100, 30, dtype=torch.float64)
+    z_r = torch.linspace(0, 100, 40, dtype=torch.float64)
+    z_c = torch.linspace(0, 100, 50, dtype=torch.float64)
+    phi_l = torch.randn(3, 30, dtype=torch.float64)
+    phi_r = torch.randn(5, 40, dtype=torch.float64)
+    rho = torch.ones(50, dtype=torch.float64)
+    C = mode_coupling(phi_l, phi_r, z_l, z_r, z_c, rho)
+    assert C.shape == (3, 5)
+
+
+def test_range_stepper_single_segment():
+    M = 5
+    k = torch.randn(M, dtype=torch.complex128) * 0.01 + 0.04
+    A0 = torch.ones(M, dtype=torch.complex128)
+    dr = 1000.0
+
+    A = range_stepper(A0, [k], [dr])
+    expected = A0 * torch.exp(-1j * k * dr)
+    assert torch.allclose(A, expected, atol=1e-12)
+
+
+def test_range_stepper_multi_segment():
+    M = 3
+    k1 = torch.tensor([0.04, 0.03, 0.02], dtype=torch.complex128)
+    k2 = torch.tensor([0.041, 0.031, 0.021], dtype=torch.complex128)
+    A0 = torch.ones(M, dtype=torch.complex128)
+    C = torch.eye(M, dtype=torch.complex128)
+
+    A = range_stepper(A0, [k1, k2], [1000.0, 2000.0], [C])
+    assert A.shape == (M,)
+    assert torch.isfinite(A.real).all()
+
+
+def test_range_stepper_gradcheck_k():
+    M = 3
+    k = torch.randn(M, dtype=torch.complex128, requires_grad=True) * 0.01 + 0.04
+    A0 = torch.ones(M, dtype=torch.complex128)
+
+    def fn(kk):
+        return range_stepper(A0, [kk], [1000.0]).abs().sum()
+
+    assert gradcheck(fn, (k,), eps=1e-7, atol=1e-4)
+
+
+def test_range_stepper_gradcheck_A0():
+    M = 3
+    k = torch.tensor([0.04, 0.03, 0.02], dtype=torch.complex128)
+    A0 = torch.ones(M, dtype=torch.complex128, requires_grad=True)
+
+    def fn(a):
+        return range_stepper(a, [k], [1000.0]).abs().sum()
+
+    assert gradcheck(fn, (A0,), eps=1e-7, atol=1e-4)
+
+
+def test_interp_batch_parity():
+    z = torch.linspace(0, 10, 20, dtype=torch.float64)
+    values = torch.stack([torch.sin(z), torch.cos(z), z**2])
+    q = torch.tensor([1.5, 5.5, 8.3], dtype=torch.float64)
+
+    batch_out = interp_batch(z, values, q)
+    ref = torch.stack([searchsorted_lerp(z, values[m], q) for m in range(3)])
+    assert torch.allclose(batch_out, ref, atol=1e-14)
+
+
+def test_interp_batch_shape():
+    z = torch.linspace(0, 100, 50, dtype=torch.float64)
+    values = torch.randn(10, 50, dtype=torch.float64)
+    q = torch.linspace(5, 95, 30, dtype=torch.float64)
+    out = interp_batch(z, values, q)
+    assert out.shape == (10, 30)
+
+
+def test_interp_batch_gradcheck():
+    z = torch.linspace(0, 10, 15, dtype=torch.float64)
+    values = torch.randn(3, 15, dtype=torch.float64, requires_grad=True)
+    q = torch.tensor([2.0, 5.0, 8.0], dtype=torch.float64)
+
+    def fn(v):
+        return interp_batch(z, v, q).sum()
+
+    assert gradcheck(fn, (values,), eps=1e-7, atol=1e-5)
+
+
+def test_weighted_depth_integral_constant():
+    z = torch.linspace(0, 10, 100, dtype=torch.float64)
+    f = torch.ones(100, dtype=torch.float64)
+    rho = torch.ones(100, dtype=torch.float64)
+    result = weighted_depth_integral(f, z, rho)
+    assert abs(result.item() - 10.0) < 1e-10
+
+
+def test_weighted_depth_integral_with_rho():
+    z = torch.linspace(0, 10, 100, dtype=torch.float64)
+    f = torch.ones(100, dtype=torch.float64)
+    rho = torch.full((100,), 2.0, dtype=torch.float64)
+    result = weighted_depth_integral(f, z, rho)
+    assert abs(result.item() - 5.0) < 1e-10
+
+
+def test_weighted_depth_inner_product_matrix():
+    z = torch.linspace(0, 10, 50, dtype=torch.float64)
+    f = torch.randn(3, 50, dtype=torch.float64)
+    g = torch.randn(4, 50, dtype=torch.float64)
+    rho = torch.ones(50, dtype=torch.float64)
+    C = weighted_depth_inner_product(f, g, z, rho)
+    assert C.shape == (3, 4)
+
+
+def test_weighted_depth_integral_gradcheck():
+    z = torch.linspace(0, 10, 20, dtype=torch.float64)
+    f = torch.randn(20, dtype=torch.float64, requires_grad=True)
+    rho = torch.ones(20, dtype=torch.float64)
+
+    def fn(ff):
+        return weighted_depth_integral(ff, z, rho)
+
+    assert gradcheck(fn, (f,), eps=1e-7, atol=1e-5)

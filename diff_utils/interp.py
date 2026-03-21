@@ -45,4 +45,17 @@ def searchsorted_lerp(
     return out
 
 
-__all__ = ["SearchsortedLerpFn", "searchsorted_lerp"]
+def interp_batch(
+    z_knots: torch.Tensor,
+    values_batch: torch.Tensor,
+    z_query: torch.Tensor,
+) -> torch.Tensor:
+    M = values_batch.shape[0]
+    Q = z_query.shape[0]
+    out = torch.zeros(M, Q, dtype=values_batch.dtype, device=values_batch.device)
+    for m in range(M):
+        out[m] = searchsorted_lerp(z_knots, values_batch[m], z_query)
+    return out
+
+
+__all__ = ["SearchsortedLerpFn", "searchsorted_lerp", "interp_batch"]
