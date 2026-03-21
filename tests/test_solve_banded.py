@@ -1,4 +1,3 @@
-
 import os
 import time
 from typing import Dict
@@ -321,7 +320,7 @@ def test_backward_vjp_formula_real_multiple_bandwidths(kl: int, ku: int, seed: i
 
 @pytest.mark.parametrize("kl,ku,seed", [(1, 1, 44), (2, 1, 45)])
 def test_backward_vjp_formula_complex_multiple_bandwidths(kl: int, ku: int, seed: int) -> None:
-    #b_bar=A^{-H}x_bar and values_bar=-conj(b_bar[row])*conj(x[col])
+    # b_bar=A^{-H}x_bar and values_bar=-conj(b_bar[row])*conj(x[col])
     n, batch, rhs = 16, 2, 3
     diags = _rand_diags(n, kl, ku, dtype=torch.complex128, seed=seed)
     A = make_banded_csr(diags, n)
@@ -520,7 +519,6 @@ def test_performance_empirical_linear_scaling() -> None:
 
 
 def test_vmap_over_batch_dimension_of_b() -> None:
-    
     n, batch = 24, 6
     diags = _rand_diags(n, 1, 1, dtype=torch.float64, seed=16)
     A = make_banded_csr(diags, n)

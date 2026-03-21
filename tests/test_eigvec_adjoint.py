@@ -1,4 +1,3 @@
-
 import sys
 from pathlib import Path
 
@@ -161,9 +160,7 @@ def test_degpert_no_clusters_matches_standard():
     x_star = evals[:M].contiguous()
     grad_phi = torch.randn(M, N, dtype=torch.float64)
 
-    grad_x_dp, grad_d_dp, grad_e_dp = eigvec_degpert(
-        phi, x_star, d, e, grad_phi, tau=1e-15
-    )
+    grad_x_dp, grad_d_dp, grad_e_dp = eigvec_degpert(phi, x_star, d, e, grad_phi, tau=1e-15)
 
     grad_x_std = torch.zeros(M, dtype=torch.float64)
     grad_d_std = torch.zeros(N, dtype=torch.float64)

@@ -1,5 +1,5 @@
-
 import torch
+
 
 class TrapezoidalNormFn(torch.autograd.Function):
     @staticmethod
@@ -43,6 +43,7 @@ class TrapezoidalNormFn(torch.autograd.Function):
 
         return grad_phi, grad_B1, grad_B1C, grad_rho, None, None
 
+
 def _forward_python(phi, B1, B1C, rho, h, omega2):
     N1 = phi.shape[0]
     device = phi.device
@@ -69,6 +70,7 @@ def _forward_python(phi, B1, B1C, rho, h, omega2):
     perturb = 1j * torch.sum(weights_c * B1C_f.to(torch.complex128) * phi_sq / rho_val)
 
     return sq_norm, slow, perturb
+
 
 def _backward_python(grad_sq, grad_sl, grad_pr, phi, B1, B1C, rho, h, omega2):
     N1 = phi.shape[0]
@@ -114,6 +116,7 @@ def _backward_python(grad_sq, grad_sl, grad_pr, phi, B1, B1C, rho, h, omega2):
 
     return grad_phi, grad_B1, grad_B1C, grad_rho
 
+
 def trapezoidal_normalization(
     phi: torch.Tensor,
     B1: torch.Tensor,
@@ -123,6 +126,7 @@ def trapezoidal_normalization(
     omega2: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return TrapezoidalNormFn.apply(phi, B1, B1C, rho, h, omega2)
+
 
 def _multilayer_layout(phi, B1, B1C, layer_sizes, h, layer_rho):
     if layer_sizes.ndim != 1 or h.ndim != 1 or layer_rho.ndim != 1:
@@ -180,6 +184,7 @@ def _multilayer_layout(phi, B1, B1C, layer_sizes, h, layer_rho):
 
     return phi_g, B1_g, B1C_g, phi_idx, b_idx, valid, weights, h, layer_rho
 
+
 def _multilayer_forward_python(phi, B1, B1C, layer_sizes, h, layer_rho, omega2):
     phi_g, B1_g, B1C_g, _, _, _, weights, h, layer_rho = _multilayer_layout(
         phi, B1, B1C, layer_sizes, h, layer_rho
@@ -211,6 +216,7 @@ def _multilayer_forward_python(phi, B1, B1C, layer_sizes, h, layer_rho, omega2):
     slow = torch.sum(slow_coeff * phi_sq, dim=(0, 1))
     perturb = torch.sum(perturb_coeff * phi_sq, dim=(0, 1))
     return sq_norm, slow, perturb
+
 
 def _multilayer_backward_python(
     grad_sq, grad_sl, grad_pr, phi, B1, B1C, layer_sizes, h, layer_rho, omega2
@@ -284,6 +290,7 @@ def _multilayer_backward_python(
     grad_h = torch.zeros_like(h, dtype=torch.float64, device=phi.device)
     return grad_phi, grad_B1, grad_B1C, None, grad_h, grad_layer_rho
 
+
 class TrapezoidalMultiLayerNormFn(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -329,6 +336,7 @@ class TrapezoidalMultiLayerNormFn(torch.autograd.Function):
         )
         return grad_phi, grad_B1, grad_B1C, None, grad_h, grad_layer_rho, None
 
+
 def trapezoidal_multilayer_normalization(
     phi: torch.Tensor,
     B1: torch.Tensor,
@@ -339,6 +347,7 @@ def trapezoidal_multilayer_normalization(
     omega2: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return TrapezoidalMultiLayerNormFn.apply(phi, B1, B1C, layer_sizes, h, layer_rho, omega2)
+
 
 __all__ = [
     "TrapezoidalNormFn",

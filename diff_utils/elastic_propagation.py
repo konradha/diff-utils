@@ -1,12 +1,11 @@
-
 import torch
 
 ROOF = 1.0e50
 FLOOR = 1.0e-50
 IPOWER_R = 50
 
-class ElasticPropagationFn(torch.autograd.Function):
 
+class ElasticPropagationFn(torch.autograd.Function):
     @staticmethod
     def forward(
         B1: torch.Tensor,
@@ -81,6 +80,7 @@ class ElasticPropagationFn(torch.autograd.Function):
             None,
         )
 
+
 def _forward_impl(B1, B2, B3, B4, rho, x, y_init, h_step, n_steps, loc_start, going_up):
     two_x = 2.0 * x
     two_h = 2.0 * h_step
@@ -139,6 +139,7 @@ def _forward_impl(B1, B2, B3, B4, rho, x, y_init, h_step, n_steps, loc_start, go
         y_history[step + 1] = y
 
     return z.clone(), y_history, i_power
+
 
 def _backward_impl(
     grad_y_out,
@@ -237,6 +238,7 @@ def _backward_impl(
 
     return grad_B1, grad_B2, grad_B3, grad_B4, grad_rho, d_y_init
 
+
 def elastic_propagation(
     B1: torch.Tensor,
     B2: torch.Tensor,
@@ -264,5 +266,6 @@ def elastic_propagation(
         going_up,
     )
     return y_out, int(i_power_t.item())
+
 
 __all__ = ["ElasticPropagationFn", "elastic_propagation"]

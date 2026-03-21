@@ -2,6 +2,7 @@ import torch
 
 from diff_utils.solve_banded import make_banded_csr, solve_banded
 
+
 class EigvecReattachFn(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -43,6 +44,7 @@ class EigvecReattachFn(torch.autograd.Function):
 
             return None, grad_x, grad_d, grad_e
 
+
 def _backward_single(grad_phi, phi, x_star, d_vals, e_vals):
     N = phi.shape[0]
 
@@ -70,6 +72,7 @@ def _backward_single(grad_phi, phi, x_star, d_vals, e_vals):
 
     return None, grad_x_out, grad_d_out, grad_e_out
 
+
 def _find_clusters(x_star: torch.Tensor, tau: float):
     if tau <= 0.0 or x_star.dim() == 0 or x_star.shape[0] < 2:
         return []
@@ -87,11 +90,13 @@ def _find_clusters(x_star: torch.Tensor, tau: float):
         start = end
     return clusters
 
+
 def _apply_tridiag(d, e, v):
     result = d * v
     result[:-1] += e * v[1:]
     result[1:] += e * v[:-1]
     return result
+
 
 def eigvec_reattach(
     phi: torch.Tensor,
@@ -100,6 +105,7 @@ def eigvec_reattach(
     e_vals: torch.Tensor,
 ) -> torch.Tensor:
     return EigvecReattachFn.apply(phi, x_star, d_vals, e_vals)
+
 
 def eigvec_degpert(
     phi: torch.Tensor,  # [M, N] mode shapes
@@ -181,6 +187,7 @@ def eigvec_degpert(
 
     return grad_x, grad_d, grad_e
 
+
 def tridiag_eigvec_adjoint(
     phi: torch.Tensor,
     d_vals: torch.Tensor,
@@ -225,6 +232,7 @@ def tridiag_eigvec_adjoint(
 
     return grad_d_out, grad_e_out
 
+
 class TridiagEigvecAdjointFn(torch.autograd.Function):
     @staticmethod
     def forward(phi, d_vals, e_vals, tau, eps):
@@ -250,6 +258,7 @@ class TridiagEigvecAdjointFn(torch.autograd.Function):
         )
         return None, grad_d, grad_e, None, None
 
+
 def tridiag_eigvec_reattach(
     phi: torch.Tensor,
     d_vals: torch.Tensor,
@@ -259,6 +268,7 @@ def tridiag_eigvec_reattach(
     eps: float = 1e-10,
 ) -> torch.Tensor:
     return TridiagEigvecAdjointFn.apply(phi, d_vals, e_vals, tau, eps)
+
 
 __all__ = [
     "EigvecReattachFn",

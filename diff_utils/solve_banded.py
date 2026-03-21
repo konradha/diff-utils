@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 import os
 from typing import Dict, Tuple
@@ -8,10 +7,12 @@ import torch
 
 from diff_utils._ext import _cpu_ext, _tensor_has_storage
 
+
 @dataclass(frozen=True)
 class _RHSLayout:
     mode: str
     shape: torch.Size
+
 
 _SCIPY_LINALG = None
 _SCIPY_FAILED = False
@@ -19,8 +20,10 @@ _VALIDATED_PATTERNS = set()
 _SCIPY_STRUCT_CACHE = {}
 _SCIPY_VALUE_CACHE = {}
 
+
 def _force_cpp() -> bool:
     return os.getenv("BANDED_FORCE_CPP", "0") == "1"
+
 
 def _scipy_linalg():
     global _SCIPY_LINALG, _SCIPY_FAILED
@@ -36,6 +39,7 @@ def _scipy_linalg():
             _SCIPY_LINALG = None
     return _SCIPY_LINALG
 
+
 def _validate_bandwidth(kl: int, ku: int, n: int) -> None:
     if kl < 0 or ku < 0:
         raise ValueError(f"kl and ku must be non-negative, got kl={kl}, ku={ku}")
@@ -44,18 +48,22 @@ def _validate_bandwidth(kl: int, ku: int, n: int) -> None:
             f"kl+ku+1 must be <= N, got kl={kl}, ku={ku}, N={n}, kl+ku+1={kl + ku + 1}"
         )
 
+
 def _expected_row_nnz(i: int, n: int, kl: int, ku: int) -> int:
     lo = max(0, i - kl)
     hi = min(n - 1, i + ku)
     return hi - lo + 1
 
+
 def _expected_nnz(n: int, kl: int, ku: int) -> int:
     return n * (kl + ku + 1) - (kl * (kl + 1)) // 2 - (ku * (ku + 1)) // 2
+
 
 def _csr_row_indices(crow: torch.Tensor) -> torch.Tensor:
     n = crow.numel() - 1
     counts = crow[1:] - crow[:-1]
     return torch.repeat_interleave(torch.arange(n, device=crow.device), counts)
+
 
 def _validate_banded_csr_pattern(
     crow: torch.Tensor,
@@ -92,6 +100,7 @@ def _validate_banded_csr_pattern(
         if not torch.equal(col[rs:re], expected_cols):
             raise ValueError(f"Row {i} columns do not match canonical banded CSR ordering")
 
+
 def _validate_banded_csr_pattern_cached(
     crow: torch.Tensor,
     col: torch.Tensor,
@@ -112,6 +121,7 @@ def _validate_banded_csr_pattern_cached(
         return
     _validate_banded_csr_pattern(crow, col, n, kl, ku)
     _VALIDATED_PATTERNS.add(key)
+
 
 def _rhs_to_canonical(b: torch.Tensor, n: int) -> Tuple[torch.Tensor, _RHSLayout]:
     if b.dim() == 1:
@@ -139,6 +149,7 @@ def _rhs_to_canonical(b: torch.Tensor, n: int) -> Tuple[torch.Tensor, _RHSLayout
         f"Unsupported b rank {b.dim()}. Expected rank in {{1,2,3}} with N={n} on the solve axis"
     )
 
+
 def _rhs_from_canonical(x: torch.Tensor, layout: _RHSLayout) -> torch.Tensor:
     if layout.mode == "vec":
         return x.reshape(layout.shape)
@@ -149,6 +160,7 @@ def _rhs_from_canonical(x: torch.Tensor, layout: _RHSLayout) -> torch.Tensor:
     if layout.mode == "batch_nrhs":
         return x.reshape(layout.shape)
     raise RuntimeError(f"Unknown rhs layout mode {layout.mode}")
+
 
 def _values_to_band(
     crow: torch.Tensor,
@@ -173,6 +185,7 @@ def _values_to_band(
     band[(offsets + kl).to(torch.int64), row.to(torch.int64)] = values
     return band.contiguous()
 
+
 def _csr_lu_factorize(
     crow: torch.Tensor,
     col: torch.Tensor,
@@ -191,6 +204,7 @@ def _csr_lu_factorize(
         return ext.csr_lu_factorize(crow, col, values, kl, ku)
     band = _values_to_band(crow, col, values, n, kl, ku)
     return _lu_factorize(band, kl, ku)
+
 
 def _solve_scipy_banded(
     crow: torch.Tensor,
@@ -235,6 +249,7 @@ def _solve_scipy_banded(
         x = x.to(dtype=b3.dtype, device=b3.device)
     return x.reshape(n, b3.shape[0], b3.shape[2]).permute(1, 0, 2).contiguous()
 
+
 def _solve_adjoint_scipy_banded(
     crow: torch.Tensor,
     col: torch.Tensor,
@@ -247,6 +262,7 @@ def _solve_adjoint_scipy_banded(
         return None
     crow_h, col_h, values_h = _csr_adjoint(crow, col, values, int(crow.numel() - 1))
     return _solve_scipy_banded(crow_h, col_h, values_h, g3, ku, kl)
+
 
 def _scipy_ab_matrix(
     crow: torch.Tensor,
@@ -305,6 +321,7 @@ def _scipy_ab_matrix(
             _SCIPY_VALUE_CACHE[value_key] = ab
     return ab
 
+
 def _solve_scipy_direct_rhs(
     crow: torch.Tensor,
     col: torch.Tensor,
@@ -341,6 +358,7 @@ def _solve_scipy_direct_rhs(
         x = x.to(dtype=b.dtype, device=b.device)
     return x
 
+
 def _lu_factorize(band: torch.Tensor, kl: int, ku: int) -> torch.Tensor:
     if band.device.type != "cpu":
         raise ValueError("solve_banded currently supports CPU only")
@@ -362,6 +380,7 @@ def _lu_factorize(band: torch.Tensor, kl: int, ku: int) -> torch.Tensor:
                 if 0 <= dij < kl + ku + 1:
                     lu[dij, i] = lu[dij, i] - factor * lu[kl + (j - k), k]
     return lu
+
 
 def _lu_solve(lu: torch.Tensor, b: torch.Tensor, kl: int, ku: int) -> torch.Tensor:
     if lu.device.type != "cpu" or b.device.type != "cpu":
@@ -385,6 +404,7 @@ def _lu_solve(lu: torch.Tensor, b: torch.Tensor, kl: int, ku: int) -> torch.Tens
             acc = acc - lu[kl + t, i] * x[:, i + t, :]
         x[:, i, :] = acc / lu[kl, i]
     return x.contiguous()
+
 
 def _lu_solve_adjoint(
     lu: torch.Tensor,
@@ -424,6 +444,7 @@ def _lu_solve_adjoint(
         out[:, i, :] = acc
     return out.contiguous()
 
+
 def _csr_adjoint(
     crow: torch.Tensor,
     col: torch.Tensor,
@@ -442,6 +463,7 @@ def _csr_adjoint(
     if torch.is_complex(values_t):
         values_t = values_t.conj()
     return crow_t, col_t, values_t
+
 
 def make_banded_csr(diags: Dict[int, torch.Tensor], n: int) -> torch.Tensor:
     if n <= 0:
@@ -497,6 +519,7 @@ def make_banded_csr(diags: Dict[int, torch.Tensor], n: int) -> torch.Tensor:
     col = torch.cat(col_parts).to(torch.int64).contiguous()
     values = torch.cat(val_parts).to(dtype=dtype).contiguous()
     return torch.sparse_csr_tensor(crow, col, values, size=(n, n), dtype=dtype, device=device)
+
 
 class _SolveBandedValuesFn(torch.autograd.Function):
     @staticmethod
@@ -635,6 +658,7 @@ class _SolveBandedValuesFn(torch.autograd.Function):
 
         return (torch.stack(xs, dim=0), torch.stack(lus, dim=0)), (0, 0)
 
+
 def _extract_csr_components(
     A: torch.Tensor,
     kl: int,
@@ -655,6 +679,7 @@ def _extract_csr_components(
     col = A.col_indices()
     values = A.values()
     return crow, col, values
+
 
 def solve_banded_csr_values(
     crow: torch.Tensor,
@@ -678,8 +703,10 @@ def solve_banded_csr_values(
     x, _ = _SolveBandedValuesFn.apply(crow, col, values, b, kl, ku)
     return x
 
+
 def solve_banded(A: torch.Tensor, b: torch.Tensor, kl: int, ku: int) -> torch.Tensor:
     crow, col, values = _extract_csr_components(A, kl, ku)
     return solve_banded_csr_values(crow, col, values, b, kl, ku)
+
 
 __all__ = ["make_banded_csr", "solve_banded", "solve_banded_csr_values"]

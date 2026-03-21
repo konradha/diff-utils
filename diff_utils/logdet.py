@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Tuple
@@ -21,6 +20,7 @@ except Exception:
     zgbtrf = None
     zgbtrs = None
 
+
 @dataclass(frozen=True)
 class _BandLayout:
     n: int
@@ -29,9 +29,11 @@ class _BandLayout:
     ldab: int
     main_row: int
 
+
 @lru_cache(maxsize=128)
 def _layout(n: int, kl: int, ku: int) -> _BandLayout:
     return _BandLayout(n=n, kl=kl, ku=ku, ldab=2 * kl + ku + 1, main_row=kl + ku)
+
 
 def _require_lapack() -> None:
     if dgbtrf is None or dgbtrs is None:
@@ -39,11 +41,13 @@ def _require_lapack() -> None:
             "SciPy LAPACK wrappers are required for banded_logdet"
         ) from _LAPACK_IMPORT_ERROR
 
+
 def _require_complex_lapack() -> None:
     if zgbtrf is None or zgbtrs is None:
         raise RuntimeError(
             "SciPy complex LAPACK wrappers (zgbtrf/zgbtrs) are required for complex banded_logdet"
         )
+
 
 def _check_input(A_band: torch.Tensor, kl: int, ku: int) -> _BandLayout:
     if not isinstance(kl, int) or not isinstance(ku, int):
@@ -64,11 +68,13 @@ def _check_input(A_band: torch.Tensor, kl: int, ku: int) -> _BandLayout:
         raise ValueError(f"A_band first dim must be 2*kl+ku+1={lay.ldab}, got {A_band.shape[0]}")
     return lay
 
+
 def _as_fortran_copy(A_band: torch.Tensor, kl: int) -> np.ndarray:
     ab = np.array(A_band.detach().contiguous().numpy(), dtype=np.float64, order="F", copy=True)
     if kl > 0:
         ab[:kl, :] = 0.0
     return ab
+
 
 def _as_fortran_copy_complex(A_band: torch.Tensor, kl: int) -> np.ndarray:
     ab = np.array(
@@ -81,6 +87,7 @@ def _as_fortran_copy_complex(A_band: torch.Tensor, kl: int) -> np.ndarray:
         ab[:kl, :] = 0.0
     return ab
 
+
 def _swap_count(ipiv: np.ndarray) -> int:
     n = int(ipiv.shape[0])
     if n == 0:
@@ -88,6 +95,7 @@ def _swap_count(ipiv: np.ndarray) -> int:
     if int(ipiv.min()) >= 1 and int(ipiv.max()) <= n:
         return int(np.count_nonzero(ipiv != (np.arange(n, dtype=ipiv.dtype) + 1)))
     return int(np.count_nonzero(ipiv != np.arange(n, dtype=ipiv.dtype)))
+
 
 def _forward_impl(A_band: torch.Tensor, kl: int, ku: int):
     lay = _check_input(A_band, kl, ku)
@@ -108,6 +116,7 @@ def _forward_impl(A_band: torch.Tensor, kl: int, ku: int):
         logabsdet = float(np.log(np.abs(u_diag)).sum(dtype=np.float64))
         singular = False
     return lay, lu, ipiv, singular, sign, logabsdet
+
 
 def _forward_impl_complex(A_band: torch.Tensor, kl: int, ku: int):
     lay = _check_input(A_band, kl, ku)
@@ -130,6 +139,7 @@ def _forward_impl_complex(A_band: torch.Tensor, kl: int, ku: int):
         singular = False
     return lay, lu, ipiv, singular, sign, logabsdet
 
+
 def _chunk_size_for_inverse_t(n: int, target_bytes: int = 64 * 1024 * 1024) -> int:
     if n <= 0:
         return 1
@@ -140,6 +150,7 @@ def _chunk_size_for_inverse_t(n: int, target_bytes: int = 64 * 1024 * 1024) -> i
     if chunk > n:
         chunk = n
     return int(chunk)
+
 
 class BandedLogDet(torch.autograd.Function):
     @staticmethod
@@ -216,8 +227,10 @@ class BandedLogDet(torch.autograd.Function):
         grad_A = torch.from_numpy(np.ascontiguousarray(grad_ab))
         return grad_A, None, None
 
+
 def banded_logdet(A_band: torch.Tensor, kl: int, ku: int) -> Tuple[torch.Tensor, torch.Tensor]:
     return BandedLogDet.apply(A_band, int(kl), int(ku))
+
 
 def dense_to_lapack_band(A: torch.Tensor, kl: int, ku: int) -> torch.Tensor:
     if A.device.type != "cpu":
@@ -240,6 +253,7 @@ def dense_to_lapack_band(A: torch.Tensor, kl: int, ku: int) -> torch.Tensor:
             band[row, : n + d] = diag
     return band
 
+
 def lapack_band_to_dense(A_band: torch.Tensor, kl: int, ku: int) -> torch.Tensor:
     lay = _check_input(A_band, kl, ku)
     dense = torch.zeros((lay.n, lay.n), dtype=A_band.dtype)
@@ -257,6 +271,7 @@ def lapack_band_to_dense(A_band: torch.Tensor, kl: int, ku: int) -> torch.Tensor
             j = i + d
             dense[i, j] = vals[: lay.n + d]
     return dense
+
 
 __all__ = [
     "BandedLogDet",

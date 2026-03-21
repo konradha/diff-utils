@@ -1,7 +1,7 @@
-
 import torch
 
 from diff_utils.interp import searchsorted_lerp
+
 
 def mode_coupling(
     phi_left: torch.Tensor,
@@ -36,5 +36,6 @@ def mode_coupling(
 
     C = phi_L_c @ (w_rho.unsqueeze(1) * phi_R_c.T)  # [M_L, M_R]
     return C
+
 
 __all__ = ["mode_coupling"]

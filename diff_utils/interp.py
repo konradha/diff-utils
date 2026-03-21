@@ -1,7 +1,7 @@
-
 import torch
 
 from diff_utils._ext import _cpu_ext
+
 
 class SearchsortedLerpFn(torch.autograd.Function):
     @staticmethod
@@ -33,6 +33,7 @@ class SearchsortedLerpFn(torch.autograd.Function):
         grad_values = ext.searchsorted_lerp_bwd(grad_out.contiguous(), idx, weights, ctx.n_knots)
         return None, grad_values, None
 
+
 def searchsorted_lerp(
     z_knots: torch.Tensor,
     values: torch.Tensor,
@@ -40,6 +41,7 @@ def searchsorted_lerp(
 ) -> torch.Tensor:
     out, _, _ = SearchsortedLerpFn.apply(z_knots, values, z_query)
     return out
+
 
 def interp_batch(
     z_knots: torch.Tensor,
@@ -52,5 +54,6 @@ def interp_batch(
     for m in range(M):
         out[m] = searchsorted_lerp(z_knots, values_batch[m], z_query)
     return out
+
 
 __all__ = ["SearchsortedLerpFn", "searchsorted_lerp", "interp_batch"]

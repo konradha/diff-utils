@@ -18,7 +18,7 @@ from .eigvec_adjoint import (
 )
 from .elastic_propagation import ElasticPropagationFn, elastic_propagation
 from .krakel_ift import krakel_eigenvalue_ift
-from .kraken_ift import KrakenEigenvalueIFT, kraken_eigenvalue_ift
+from .kraken_ift import KrakenEigenvalueIFT, kraken_eigenvalue_ift, kraken_multilayer_ift
 from .tridiag_eigh import tridiag_eigh
 from .mode_coupling import mode_coupling
 from .range_stepper import range_stepper, range_stepper_batched
@@ -52,6 +52,7 @@ __all__ = [
     "krakel_eigenvalue_ift",
     "KrakenEigenvalueIFT",
     "kraken_eigenvalue_ift",
+    "kraken_multilayer_ift",
     "tridiag_eigh",
     "mode_coupling",
     "range_stepper",

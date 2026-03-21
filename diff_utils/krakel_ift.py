@@ -1,10 +1,10 @@
-
 from typing import Callable
 
 import torch
 
 from diff_utils.logdet import banded_logdet
 from diff_utils.eigenvalue_ift import eigenvalue_ift
+
 
 def krakel_eigenvalue_ift(
     x_converged: torch.Tensor,
@@ -17,5 +17,6 @@ def krakel_eigenvalue_ift(
         return logabsdet
 
     return eigenvalue_ift(x_converged, dispersion_fn, *theta_tensors)
+
 
 __all__ = ["krakel_eigenvalue_ift"]

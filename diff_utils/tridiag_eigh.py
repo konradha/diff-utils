@@ -1,7 +1,7 @@
-
 import numpy as np
 import torch
 from scipy.linalg.lapack import dstev
+
 
 class TridiagEigh(torch.autograd.Function):
     @staticmethod
@@ -49,6 +49,7 @@ class TridiagEigh(torch.autograd.Function):
 
         return grad_d, grad_e, None
 
+
 def tridiag_eigh(
     d: torch.Tensor,
     e: torch.Tensor,
@@ -56,5 +57,6 @@ def tridiag_eigh(
     eps: float = 1e-12,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return TridiagEigh.apply(d, e, eps)
+
 
 __all__ = ["tridiag_eigh"]

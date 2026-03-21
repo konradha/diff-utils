@@ -1,7 +1,7 @@
-
 import torch
 
 from diff_utils._ext import _cpu_ext
+
 
 class AcousticRecurrenceFn(torch.autograd.Function):
     @staticmethod
@@ -60,6 +60,7 @@ class AcousticRecurrenceFn(torch.autograd.Function):
 
         return grad_B1, grad_h2k2, None, None, grad_p1_init, grad_p2_init
 
+
 def _backward_python(
     grad_f_num,
     grad_g_val,
@@ -112,6 +113,7 @@ def _backward_python(
 
     return grad_B1, grad_h2k2, grad_p1_init, grad_p2_init
 
+
 def acoustic_recurrence(
     B1: torch.Tensor,
     h2k2: torch.Tensor,
@@ -122,5 +124,6 @@ def acoustic_recurrence(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     f_num, g_val, _ = AcousticRecurrenceFn.apply(B1, h2k2, loc_start, loc_end, p1_init, p2_init)
     return f_num, g_val
+
 
 __all__ = ["AcousticRecurrenceFn", "acoustic_recurrence"]
