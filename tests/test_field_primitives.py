@@ -9,7 +9,7 @@ from torch.autograd import gradcheck
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from diff_utils.mode_coupling import mode_coupling
-from diff_utils.range_stepper import range_stepper
+from diff_utils.range_stepper import range_stepper, range_stepper_batched
 from diff_utils.interp import interp_batch, searchsorted_lerp
 from diff_utils.weighted_depth_integral import (
     weighted_depth_integral,
@@ -151,3 +151,76 @@ def test_weighted_depth_integral_gradcheck():
         return weighted_depth_integral(ff, z, rho)
 
     assert gradcheck(fn, (f,), eps=1e-7, atol=1e-5)
+
+
+def test_batched_single_segment_parity():
+    M = 5
+    k = torch.randn(M, dtype=torch.complex128) * 0.01 + 0.04
+    A0 = torch.ones(M, dtype=torch.complex128)
+    r = torch.tensor([1000.0, 3000.0, 5000.0, 10000.0], dtype=torch.float64)
+
+    A_batched = range_stepper_batched(A0, k, r, torch.tensor([], dtype=torch.float64))
+
+    for i, ri in enumerate(r):
+        A_ref = A0 * torch.exp(-1j * k * ri)
+        assert torch.allclose(A_batched[:, i], A_ref, atol=1e-12), f"r={ri}"
+
+
+def test_batched_multi_segment_parity():
+    M = 3
+    k1 = torch.tensor([0.04, 0.03, 0.02], dtype=torch.complex128)
+    k2 = torch.tensor([0.041, 0.031, 0.021], dtype=torch.complex128)
+    A0 = torch.ones(M, dtype=torch.complex128)
+    C = torch.eye(M, dtype=torch.complex128) * 0.95
+
+    r_bnd = torch.tensor([5000.0], dtype=torch.float64)
+    r = torch.tensor([2000.0, 4000.0, 7000.0, 12000.0], dtype=torch.float64)
+
+    A_batched = range_stepper_batched(
+        A0,
+        k1,
+        r,
+        r_bnd,
+        k_segments=[k1, k2],
+        C_interfaces=[C],
+    )
+
+    assert A_batched.shape == (M, 4)
+    assert torch.isfinite(A_batched.real).all()
+    A_r0 = A0 * torch.exp(-1j * k1 * 2000.0)
+    assert torch.allclose(A_batched[:, 0], A_r0, atol=1e-12)
+
+
+def test_batched_gradcheck_k():
+    M = 3
+    k = (torch.randn(M, dtype=torch.complex128) * 0.001 + 0.01).requires_grad_(True)
+    A0 = torch.ones(M, dtype=torch.complex128)
+    r = torch.tensor([10.0, 50.0], dtype=torch.float64)
+
+    def fn(kk):
+        return range_stepper_batched(A0, kk, r, torch.tensor([], dtype=torch.float64)).abs().sum()
+
+    assert gradcheck(fn, (k,), eps=1e-7, atol=1e-4)
+
+
+def test_batched_gradcheck_A0():
+    M = 3
+    k = torch.tensor([0.04, 0.03, 0.02], dtype=torch.complex128)
+    A0 = torch.ones(M, dtype=torch.complex128, requires_grad=True)
+    r = torch.tensor([3000.0, 7000.0], dtype=torch.float64)
+
+    def fn(a):
+        return range_stepper_batched(a, k, r, torch.tensor([], dtype=torch.float64)).abs().sum()
+
+    assert gradcheck(fn, (A0,), eps=1e-7, atol=1e-4)
+
+
+def test_batched_many_receivers():
+    M = 5
+    k = torch.randn(M, dtype=torch.complex128) * 0.01 + 0.04
+    A0 = torch.ones(M, dtype=torch.complex128)
+    r = torch.linspace(100.0, 50000.0, 200, dtype=torch.float64)
+
+    A_batched = range_stepper_batched(A0, k, r, torch.tensor([], dtype=torch.float64))
+    assert A_batched.shape == (M, 200)
+    assert torch.isfinite(A_batched.real).all()
