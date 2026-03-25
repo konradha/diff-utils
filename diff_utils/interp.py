@@ -48,12 +48,25 @@ def interp_batch(
     values_batch: torch.Tensor,
     z_query: torch.Tensor,
 ) -> torch.Tensor:
-    M = values_batch.shape[0]
-    Q = z_query.shape[0]
-    out = torch.zeros(M, Q, dtype=values_batch.dtype, device=values_batch.device)
-    for m in range(M):
-        out[m] = searchsorted_lerp(z_knots, values_batch[m], z_query)
-    return out
+    if values_batch.dim() != 2:
+        raise ValueError("interp_batch expects values_batch with shape [M, N]")
+
+    N = z_knots.shape[0]
+    if N < 2:
+        raise ValueError("interp_batch requires at least two knots")
+
+    idx_hi = torch.searchsorted(z_knots, z_query, right=False)
+    idx_hi = idx_hi.clamp(1, N - 1)
+    idx_lo = idx_hi - 1
+
+    z_lo = z_knots[idx_lo]
+    z_hi = z_knots[idx_hi]
+    denom = (z_hi - z_lo).clamp(min=torch.finfo(z_knots.dtype).eps)
+    weights = ((z_query - z_lo) / denom).to(values_batch.dtype)
+
+    left = values_batch[:, idx_lo]
+    right = values_batch[:, idx_hi]
+    return left + (right - left) * weights.unsqueeze(0)
 
 
 __all__ = ["SearchsortedLerpFn", "searchsorted_lerp", "interp_batch"]

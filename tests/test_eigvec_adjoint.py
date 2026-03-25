@@ -6,7 +6,12 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from diff_utils.eigvec_adjoint import eigvec_reattach, eigvec_degpert
+from diff_utils.eigvec_adjoint import (
+    eigvec_reattach,
+    eigvec_degpert,
+    tridiag_eigvec_reattach,
+    tridiag_eigvec_reattach_varying_batch,
+)
 
 
 def _build_tridiagonal(d, e):
@@ -201,3 +206,44 @@ def test_degpert_cluster_hamiltonian():
     H = Phi_c @ A_Phi.T  # [2, 2]
 
     assert torch.allclose(H, torch.diag(evals[:2]), atol=1e-12)
+
+
+def test_tridiag_eigvec_reattach_varying_batch_matches_single_mode_calls():
+    torch.manual_seed(7)
+    M = 3
+    N = 6
+    d_batch = []
+    e_batch = []
+    phi_batch = []
+    grad_phi = torch.randn(M, N, dtype=torch.float64)
+
+    for _ in range(M):
+        d = torch.randn(N, dtype=torch.float64) + 4.0
+        e = torch.randn(N - 1, dtype=torch.float64) * 0.15
+        A = _build_tridiagonal(d, e)
+        _, evecs = torch.linalg.eigh(A)
+        d_batch.append(d)
+        e_batch.append(e)
+        phi_batch.append(evecs[:, 0].clone())
+
+    d_batch = torch.stack(d_batch).requires_grad_(True)
+    e_batch = torch.stack(e_batch).requires_grad_(True)
+    phi_batch = torch.stack(phi_batch)
+
+    phi_out = tridiag_eigvec_reattach_varying_batch(phi_batch, d_batch, e_batch, tau=1e-8, eps=1e-10)
+    loss = (phi_out * grad_phi).sum()
+    loss.backward()
+
+    grad_d_ref = torch.zeros_like(d_batch)
+    grad_e_ref = torch.zeros_like(e_batch)
+    for m in range(M):
+        d_m = d_batch.detach()[m].clone().requires_grad_(True)
+        e_m = e_batch.detach()[m].clone().requires_grad_(True)
+        phi_m = tridiag_eigvec_reattach(phi_batch[m], d_m, e_m, tau=1e-8, eps=1e-10)
+        loss_m = (phi_m * grad_phi[m]).sum()
+        loss_m.backward()
+        grad_d_ref[m] = d_m.grad
+        grad_e_ref[m] = e_m.grad
+
+    torch.testing.assert_close(d_batch.grad, grad_d_ref, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(e_batch.grad, grad_e_ref, atol=1e-10, rtol=1e-10)

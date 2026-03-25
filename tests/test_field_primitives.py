@@ -41,6 +41,18 @@ def test_mode_coupling_shape():
     assert C.shape == (3, 5)
 
 
+def test_mode_coupling_preserves_complex_values():
+    z = torch.linspace(0, 100, 40, dtype=torch.float64)
+    rho = torch.ones(40, dtype=torch.float64)
+    phi_l = torch.stack([torch.exp(1j * 0.01 * z), torch.exp(1j * 0.02 * z)])
+    phi_r = torch.stack([torch.exp(-1j * 0.015 * z), torch.exp(1j * 0.005 * z)])
+
+    C = mode_coupling(phi_l, phi_r, z, z, z, rho)
+
+    assert C.dtype == torch.complex128
+    assert C.abs().max() > 0.0
+
+
 def test_range_stepper_single_segment():
     M = 5
     k = torch.randn(M, dtype=torch.complex128) * 0.01 + 0.04
@@ -102,6 +114,17 @@ def test_interp_batch_shape():
     q = torch.linspace(5, 95, 30, dtype=torch.float64)
     out = interp_batch(z, values, q)
     assert out.shape == (10, 30)
+
+
+def test_interp_batch_complex_shape_and_dtype():
+    z = torch.linspace(0, 100, 50, dtype=torch.float64)
+    values = torch.randn(4, 50, dtype=torch.float64) + 1j * torch.randn(
+        4, 50, dtype=torch.float64
+    )
+    q = torch.linspace(5, 95, 30, dtype=torch.float64)
+    out = interp_batch(z, values.to(torch.complex128), q)
+    assert out.shape == (4, 30)
+    assert out.dtype == torch.complex128
 
 
 def test_interp_batch_gradcheck():
@@ -215,7 +238,9 @@ def test_batched_gradcheck_A0():
 
 def test_batched_many_receivers():
     M = 5
-    k = torch.randn(M, dtype=torch.complex128) * 0.01 + 0.04
+    k_real = torch.linspace(0.03, 0.05, M, dtype=torch.float64)
+    k_imag = -torch.linspace(0.0, 2e-5, M, dtype=torch.float64)
+    k = k_real.to(torch.complex128) + 1j * k_imag.to(torch.complex128)
     A0 = torch.ones(M, dtype=torch.complex128)
     r = torch.linspace(100.0, 50000.0, 200, dtype=torch.float64)
 

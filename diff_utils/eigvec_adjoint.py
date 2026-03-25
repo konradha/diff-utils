@@ -658,6 +658,40 @@ class TridiagEigvecClusterAdjointFn(torch.autograd.Function):
         return None, grad_d, grad_e, None
 
 
+class TridiagEigvecVaryingBatchAdjointFn(torch.autograd.Function):
+    @staticmethod
+    def forward(phi_batch, d_batch, e_batch, tau, eps):
+        return phi_batch.detach().clone()
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        phi_batch, d_batch, e_batch, tau, eps = inputs
+        ctx.tau = tau
+        ctx.eps = eps
+        ctx.save_for_backward(phi_batch, d_batch, e_batch)
+
+    @staticmethod
+    def backward(ctx, grad_phi_batch):
+        phi_batch, d_batch, e_batch = ctx.saved_tensors
+        M = phi_batch.shape[0]
+        grad_d_batch = torch.zeros_like(d_batch)
+        grad_e_batch = torch.zeros_like(e_batch)
+
+        for m in range(M):
+            grad_d_m, grad_e_m = tridiag_eigvec_adjoint(
+                phi_batch[m],
+                d_batch[m],
+                e_batch[m],
+                grad_phi_batch[m],
+                tau=ctx.tau,
+                eps=ctx.eps,
+            )
+            grad_d_batch[m] = grad_d_m
+            grad_e_batch[m] = grad_e_m
+
+        return None, grad_d_batch, grad_e_batch, None, None
+
+
 def tridiag_eigvec_reattach(
     phi: torch.Tensor,
     d_vals: torch.Tensor,
@@ -679,6 +713,17 @@ def tridiag_eigvec_cluster_reattach(
     return TridiagEigvecClusterAdjointFn.apply(phi_cluster, d_vals, e_vals, eps)
 
 
+def tridiag_eigvec_reattach_varying_batch(
+    phi_batch: torch.Tensor,
+    d_batch: torch.Tensor,
+    e_batch: torch.Tensor,
+    *,
+    tau: float = 1e-8,
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    return TridiagEigvecVaryingBatchAdjointFn.apply(phi_batch, d_batch, e_batch, tau, eps)
+
+
 __all__ = [
     "EigvecReattachFn",
     "eigvec_reattach",
@@ -688,4 +733,5 @@ __all__ = [
     "tridiag_eigvec_cluster_adjoint",
     "tridiag_eigvec_reattach",
     "tridiag_eigvec_cluster_reattach",
+    "tridiag_eigvec_reattach_varying_batch",
 ]
