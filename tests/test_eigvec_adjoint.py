@@ -230,7 +230,9 @@ def test_tridiag_eigvec_reattach_varying_batch_matches_single_mode_calls():
     e_batch = torch.stack(e_batch).requires_grad_(True)
     phi_batch = torch.stack(phi_batch)
 
-    phi_out = tridiag_eigvec_reattach_varying_batch(phi_batch, d_batch, e_batch, tau=1e-8, eps=1e-10)
+    phi_out = tridiag_eigvec_reattach_varying_batch(
+        phi_batch, d_batch, e_batch, tau=1e-8, eps=1e-10
+    )
     loss = (phi_out * grad_phi).sum()
     loss.backward()
 

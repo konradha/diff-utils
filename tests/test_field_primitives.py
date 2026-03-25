@@ -118,9 +118,7 @@ def test_interp_batch_shape():
 
 def test_interp_batch_complex_shape_and_dtype():
     z = torch.linspace(0, 100, 50, dtype=torch.float64)
-    values = torch.randn(4, 50, dtype=torch.float64) + 1j * torch.randn(
-        4, 50, dtype=torch.float64
-    )
+    values = torch.randn(4, 50, dtype=torch.float64) + 1j * torch.randn(4, 50, dtype=torch.float64)
     q = torch.linspace(5, 95, 30, dtype=torch.float64)
     out = interp_batch(z, values.to(torch.complex128), q)
     assert out.shape == (4, 30)

@@ -344,71 +344,107 @@ class KrakenMultiLayerIFT(torch.autograd.Function):
 
         M = x_converged.shape[0]
         n_layers = layer_h.shape[0]
-        dtype = B1.dtype
-
-        def _eval_delta(B1_d, x_t, f_bot_t, g_bot_t, f_top_t, g_top_t):
-            f_c = f_bot_t
-            g_c = g_bot_t
-            for layer_idx in range(n_layers - 1, -1, -1):
-                h = layer_h[layer_idx].item()
-                rho = layer_rho[layer_idx].item()
-                loc = int(layer_loc[layer_idx].item())
-                n_pts = int(layer_n[layer_idx].item())
-                loc_e = loc + n_pts - 1
-
-                h2k2 = h * h * x_t
-                p1 = (-2.0 * g_c).unsqueeze(0)
-                p2 = ((B1_d[loc_e] - h2k2) * g_c - 2.0 * h * f_c * rho).unsqueeze(0)
-
-                f_num, g_val, _ = AcousticRecurrenceFn.apply(
-                    B1_d,
-                    h2k2.unsqueeze(0),
-                    loc,
-                    loc_e - 1,
-                    p1,
-                    p2,
-                )
-
-                f_c = f_num[0] / (2.0 * h * rho)
-                g_c = g_val[0]
-
-            return f_c * g_top_t - g_c * f_top_t
 
         grad_B1_total = torch.zeros_like(B1)
+        is_complex = x_converged.is_complex()
 
-        with torch.enable_grad():
-            for m in range(M):
-                x_m = x_converged[m].item()
+        f_in_layers = [None] * n_layers
+        g_in_layers = [None] * n_layers
+        h2k2_layers = [None] * n_layers
+        p1_init_layers = [None] * n_layers
+        p2_init_layers = [None] * n_layers
+        p_history_layers = [None] * n_layers
 
-                B1_track = B1.detach().clone().requires_grad_(True)
-                x_track = torch.tensor(x_m, dtype=dtype, requires_grad=True)
-                f_bot_t = torch.tensor(f_bc_bot[m].item(), dtype=dtype, requires_grad=True)
-                g_bot_t = torch.tensor(g_bc_bot[m].item(), dtype=dtype, requires_grad=True)
-                f_top_t = torch.tensor(f_bc_top[m].item(), dtype=dtype, requires_grad=True)
-                g_top_t = torch.tensor(g_bc_top[m].item(), dtype=dtype, requires_grad=True)
+        for m in range(M):
+            x_m = x_converged[m].detach()
+            f_cur = f_bc_bot[m].detach()
+            g_cur = g_bc_bot[m].detach()
 
-                delta = _eval_delta(B1_track, x_track, f_bot_t, g_bot_t, f_top_t, g_top_t)
+            for rev_idx in range(n_layers):
+                layer_idx = n_layers - 1 - rev_idx
+                h = layer_h[layer_idx]
+                rho = layer_rho[layer_idx]
+                loc = int(layer_loc[layer_idx].item())
+                n_pts = int(layer_n[layer_idx].item())
+                loc_end = loc + n_pts - 1
 
-                grads = torch.autograd.grad(
-                    delta,
-                    [B1_track, x_track, f_bot_t, g_bot_t, f_top_t, g_top_t],
+                f_in_layers[layer_idx] = f_cur
+                g_in_layers[layer_idx] = g_cur
+
+                h2k2 = h * h * x_m
+                p1_init = (-2.0 * g_cur).reshape(1)
+                p2_init = ((B1[loc_end].detach() - h2k2) * g_cur - 2.0 * h * f_cur * rho).reshape(1)
+                f_num, g_val, p_history = AcousticRecurrenceFn.apply(
+                    B1.detach(),
+                    h2k2.reshape(1),
+                    loc,
+                    loc_end - 1,
+                    p1_init,
+                    p2_init,
                 )
-                dD_dB1, dD_dx_direct, dD_df_bot, dD_dg_bot, dD_df_top, dD_dg_top = grads
 
-                dD_dx = (
-                    dD_dx_direct
-                    + dD_df_bot * dfdx_bot[m]
-                    + dD_dg_bot * dgdx_bot[m]
-                    + dD_df_top * dfdx_top[m]
-                    + dD_dg_top * dgdx_top[m]
+                h2k2_layers[layer_idx] = h2k2
+                p1_init_layers[layer_idx] = p1_init
+                p2_init_layers[layer_idx] = p2_init
+                p_history_layers[layer_idx] = p_history
+
+                scale = 2.0 * h * rho
+                f_cur = f_num[0] / scale
+                g_cur = g_val[0]
+
+            f_top_interior = f_cur
+            g_top_interior = g_cur
+
+            grad_f_cur = g_bc_top[m].detach()
+            grad_g_cur = -f_bc_top[m].detach()
+            dDelta_dx = (
+                f_top_interior * dgdx_top[m].detach() - g_top_interior * dfdx_top[m].detach()
+            )
+            grad_B1_m = torch.zeros_like(B1)
+
+            for layer_idx in range(n_layers):
+                h = layer_h[layer_idx]
+                rho = layer_rho[layer_idx]
+                loc = int(layer_loc[layer_idx].item())
+                n_pts = int(layer_n[layer_idx].item())
+                loc_end = loc + n_pts - 1
+                g_in = g_in_layers[layer_idx]
+
+                grad_f_num = (grad_f_cur / (2.0 * h * rho)).reshape(1)
+                grad_g_val = grad_g_cur.reshape(1)
+                grad_B1_layer, grad_h2k2_layer, grad_p1i_layer, grad_p2i_layer = (
+                    _run_recurrence_bwd(
+                        grad_f_num,
+                        grad_g_val,
+                        B1.detach(),
+                        h2k2_layers[layer_idx].reshape(1),
+                        p_history_layers[layer_idx],
+                        loc,
+                        loc_end - 1,
+                        p1_init_layers[layer_idx],
+                        p2_init_layers[layer_idx],
+                        is_complex,
+                    )
                 )
 
-                dD_dx_val = dD_dx.item()
-                if abs(dD_dx_val) < 1e-30:
-                    continue
+                grad_B1_m += grad_B1_layer
+                grad_B1_m[loc_end] += grad_p2i_layer[0] * g_in
 
-                ift_factor = -grad_x[m].item() / dD_dx_val
-                grad_B1_total = grad_B1_total + ift_factor * dD_dB1
+                grad_h2k2_total = grad_h2k2_layer[0] - grad_p2i_layer[0] * g_in
+                dDelta_dx = dDelta_dx + grad_h2k2_total * (h * h)
+
+                grad_f_cur = -2.0 * h * rho * grad_p2i_layer[0]
+                grad_g_cur = (
+                    -2.0 * grad_p1i_layer[0]
+                    + (B1[loc_end].detach() - h2k2_layers[layer_idx]) * grad_p2i_layer[0]
+                )
+
+            dDelta_dx = (
+                dDelta_dx + grad_f_cur * dfdx_bot[m].detach() + grad_g_cur * dgdx_bot[m].detach()
+            )
+
+            ift_factor = -grad_x[m] * _lorentz_inv(dDelta_dx, eps)
+            grad_B1_total = grad_B1_total + ift_factor * grad_B1_m
 
         return (
             None,
@@ -466,4 +502,491 @@ def kraken_multilayer_ift(
     )
 
 
-__all__ = ["KrakenEigenvalueIFT", "kraken_eigenvalue_ift", "kraken_multilayer_ift"]
+class KrakenAcousticBottomIFT(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        x_converged: torch.Tensor,
+        B1: torch.Tensor,
+        layer_h: torch.Tensor,
+        layer_rho: torch.Tensor,
+        layer_loc: torch.Tensor,
+        layer_n: torch.Tensor,
+        f_bc_top: torch.Tensor,
+        g_bc_top: torch.Tensor,
+        dfdx_top: torch.Tensor,
+        dgdx_top: torch.Tensor,
+        c_bot: torch.Tensor,
+        rho_bot: torch.Tensor,
+        omega2: float,
+        eps: float,
+    ):
+        return x_converged.detach().clone()
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        (
+            x_converged,
+            B1,
+            layer_h,
+            layer_rho,
+            layer_loc,
+            layer_n,
+            f_bc_top,
+            g_bc_top,
+            dfdx_top,
+            dgdx_top,
+            c_bot,
+            rho_bot,
+            omega2,
+            eps,
+        ) = inputs
+        ctx.omega2 = omega2
+        ctx.eps = eps
+        ctx.save_for_backward(
+            x_converged,
+            B1,
+            layer_h,
+            layer_rho,
+            layer_loc,
+            layer_n,
+            f_bc_top,
+            g_bc_top,
+            dfdx_top,
+            dgdx_top,
+            c_bot,
+            rho_bot,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_x):
+        (
+            x_converged,
+            B1,
+            layer_h,
+            layer_rho,
+            layer_loc,
+            layer_n,
+            f_bc_top,
+            g_bc_top,
+            dfdx_top,
+            dgdx_top,
+            c_bot,
+            rho_bot,
+        ) = ctx.saved_tensors
+        omega2 = ctx.omega2
+        eps = ctx.eps
+
+        M = x_converged.shape[0]
+        n_layers = layer_h.shape[0]
+        grad_B1_total = torch.zeros_like(B1)
+        grad_c_bot = torch.zeros_like(c_bot)
+        grad_rho_bot = torch.zeros_like(rho_bot)
+        floor = torch.tensor(1e-30, dtype=x_converged.dtype, device=x_converged.device)
+
+        f_in_layers = [None] * n_layers
+        g_in_layers = [None] * n_layers
+        h2k2_layers = [None] * n_layers
+        p1_init_layers = [None] * n_layers
+        p2_init_layers = [None] * n_layers
+        p_history_layers = [None] * n_layers
+
+        for m in range(M):
+            x_m = x_converged[m].detach()
+            gamma2 = x_m - omega2 / (c_bot.detach() * c_bot.detach())
+            gamma2_clamped = torch.clamp(gamma2, min=floor)
+            f_bot = torch.sqrt(gamma2_clamped)
+            g_bot = rho_bot.detach()
+
+            active = gamma2 > floor
+            if bool(active):
+                dfdx_bot = 0.5 / f_bot
+                dfdc_bot = omega2 / (c_bot.detach() * c_bot.detach() * c_bot.detach() * f_bot)
+            else:
+                dfdx_bot = x_m.new_zeros(())
+                dfdc_bot = x_m.new_zeros(())
+
+            f_cur = f_bot
+            g_cur = g_bot
+            f_top_interior = None
+            g_top_interior = None
+
+            for rev_idx in range(n_layers):
+                layer_idx = n_layers - 1 - rev_idx
+                h = layer_h[layer_idx]
+                rho = layer_rho[layer_idx]
+                loc = int(layer_loc[layer_idx].item())
+                n_pts = int(layer_n[layer_idx].item())
+                loc_end = loc + n_pts - 1
+
+                f_in_layers[layer_idx] = f_cur
+                g_in_layers[layer_idx] = g_cur
+
+                h2k2 = h * h * x_m
+                p1_init = (-2.0 * g_cur).reshape(1)
+                p2_init = ((B1[loc_end].detach() - h2k2) * g_cur - 2.0 * h * f_cur * rho).reshape(1)
+                f_num, g_val, p_history = AcousticRecurrenceFn.apply(
+                    B1.detach(),
+                    h2k2.reshape(1),
+                    loc,
+                    loc_end - 1,
+                    p1_init,
+                    p2_init,
+                )
+
+                h2k2_layers[layer_idx] = h2k2
+                p1_init_layers[layer_idx] = p1_init
+                p2_init_layers[layer_idx] = p2_init
+                p_history_layers[layer_idx] = p_history
+
+                scale = 2.0 * h * rho
+                f_cur = f_num[0] / scale
+                g_cur = g_val[0]
+
+            f_top_interior = f_cur
+            g_top_interior = g_cur
+
+            grad_f_cur = g_bc_top[m].detach()
+            grad_g_cur = -f_bc_top[m].detach()
+            dDelta_dx = (
+                f_top_interior * dgdx_top[m].detach() - g_top_interior * dfdx_top[m].detach()
+            )
+            grad_B1_m = torch.zeros_like(B1)
+
+            for layer_idx in range(n_layers):
+                h = layer_h[layer_idx]
+                rho = layer_rho[layer_idx]
+                loc = int(layer_loc[layer_idx].item())
+                n_pts = int(layer_n[layer_idx].item())
+                loc_end = loc + n_pts - 1
+                g_in = g_in_layers[layer_idx]
+
+                grad_f_num = (grad_f_cur / (2.0 * h * rho)).reshape(1)
+                grad_g_val = grad_g_cur.reshape(1)
+
+                grad_B1_layer, grad_h2k2_layer, grad_p1i_layer, grad_p2i_layer = (
+                    _run_recurrence_bwd(
+                        grad_f_num,
+                        grad_g_val,
+                        B1.detach(),
+                        h2k2_layers[layer_idx].reshape(1),
+                        p_history_layers[layer_idx],
+                        loc,
+                        loc_end - 1,
+                        p1_init_layers[layer_idx],
+                        p2_init_layers[layer_idx],
+                        False,
+                    )
+                )
+
+                grad_B1_m += grad_B1_layer
+                grad_B1_m[loc_end] += grad_p2i_layer[0] * g_in
+
+                grad_h2k2_total = grad_h2k2_layer[0] - grad_p2i_layer[0] * g_in
+                dDelta_dx = dDelta_dx + grad_h2k2_total * (h * h)
+
+                grad_f_cur = -2.0 * h * rho * grad_p2i_layer[0]
+                grad_g_cur = (
+                    -2.0 * grad_p1i_layer[0]
+                    + (B1[loc_end].detach() - h2k2_layers[layer_idx]) * grad_p2i_layer[0]
+                )
+
+            dDelta_dx = dDelta_dx + grad_f_cur * dfdx_bot
+            dDelta_dcb = grad_f_cur * dfdc_bot
+            dDelta_drb = grad_g_cur
+
+            ift_scale = -grad_x[m] * _lorentz_inv(dDelta_dx, eps)
+            grad_B1_total = grad_B1_total + ift_scale * grad_B1_m
+            grad_c_bot = grad_c_bot + ift_scale * dDelta_dcb
+            grad_rho_bot = grad_rho_bot + ift_scale * dDelta_drb
+
+        return (
+            None,
+            grad_B1_total,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            grad_c_bot,
+            grad_rho_bot,
+            None,
+            None,
+        )
+
+
+def kraken_acoustic_bottom_ift(
+    x_converged: torch.Tensor,
+    B1: torch.Tensor,
+    layer_h: torch.Tensor,
+    layer_rho: torch.Tensor,
+    layer_loc: torch.Tensor,
+    layer_n: torch.Tensor,
+    f_bc_top: torch.Tensor,
+    g_bc_top: torch.Tensor,
+    dfdx_top: torch.Tensor,
+    dgdx_top: torch.Tensor,
+    c_bot: torch.Tensor,
+    rho_bot: torch.Tensor,
+    omega2: float,
+    *,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    return KrakenAcousticBottomIFT.apply(
+        x_converged,
+        B1,
+        layer_h,
+        layer_rho,
+        layer_loc,
+        layer_n,
+        f_bc_top,
+        g_bc_top,
+        dfdx_top,
+        dgdx_top,
+        c_bot,
+        rho_bot,
+        omega2,
+        eps,
+    )
+
+
+class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        x_converged: torch.Tensor,
+        B1: torch.Tensor,
+        layer_h: torch.Tensor,
+        layer_rho: torch.Tensor,
+        layer_loc: torch.Tensor,
+        layer_n: torch.Tensor,
+        c_bot: torch.Tensor,
+        rho_bot: torch.Tensor,
+        omega2: float,
+        c_imag: float,
+        dc_imag_dc: float,
+        eps: float,
+    ):
+        return x_converged.detach().clone()
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        (
+            x_converged,
+            B1,
+            layer_h,
+            layer_rho,
+            layer_loc,
+            layer_n,
+            c_bot,
+            rho_bot,
+            omega2,
+            c_imag,
+            dc_imag_dc,
+            eps,
+        ) = inputs
+        ctx.omega2 = omega2
+        ctx.c_imag = c_imag
+        ctx.dc_imag_dc = dc_imag_dc
+        ctx.eps = eps
+        ctx.save_for_backward(
+            x_converged,
+            B1,
+            layer_h,
+            layer_rho,
+            layer_loc,
+            layer_n,
+            c_bot,
+            rho_bot,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_x):
+        (
+            x_converged,
+            B1,
+            layer_h,
+            layer_rho,
+            layer_loc,
+            layer_n,
+            c_bot,
+            rho_bot,
+        ) = ctx.saved_tensors
+        omega2 = ctx.omega2
+        c_imag = ctx.c_imag
+        dc_imag_dc = ctx.dc_imag_dc
+        eps = ctx.eps
+
+        M = x_converged.shape[0]
+        n_layers = layer_h.shape[0]
+        B1_c = B1.detach().to(torch.complex128)
+
+        grad_B1_total = torch.zeros_like(B1)
+        grad_c_bot = torch.zeros_like(c_bot)
+        grad_rho_bot = torch.zeros_like(rho_bot)
+
+        f_in_layers = [None] * n_layers
+        g_in_layers = [None] * n_layers
+        h2k2_layers = [None] * n_layers
+        p1_init_layers = [None] * n_layers
+        p2_init_layers = [None] * n_layers
+        p_history_layers = [None] * n_layers
+
+        cp_c = torch.complex(
+            c_bot.detach(), torch.tensor(c_imag, dtype=c_bot.dtype, device=c_bot.device)
+        )
+        dcp_dc = torch.complex(
+            torch.ones((), dtype=c_bot.dtype, device=c_bot.device),
+            torch.tensor(dc_imag_dc, dtype=c_bot.dtype, device=c_bot.device),
+        )
+
+        for m in range(M):
+            x_m = x_converged[m].detach().to(torch.complex128)
+            gamma2 = x_m - omega2 / (cp_c * cp_c)
+            f_bot = torch.sqrt(gamma2)
+            g_bot = rho_bot.detach().to(torch.complex128)
+            dfdx_bot = 0.5 / f_bot
+            dfdcp = omega2 / (cp_c * cp_c * cp_c * f_bot)
+            dfdc_bot = dfdcp * dcp_dc
+
+            f_cur = f_bot
+            g_cur = g_bot
+
+            for rev_idx in range(n_layers):
+                layer_idx = n_layers - 1 - rev_idx
+                h = layer_h[layer_idx]
+                rho = layer_rho[layer_idx]
+                loc = int(layer_loc[layer_idx].item())
+                n_pts = int(layer_n[layer_idx].item())
+                loc_end = loc + n_pts - 1
+
+                f_in_layers[layer_idx] = f_cur
+                g_in_layers[layer_idx] = g_cur
+
+                h2k2 = (h * h * x_m).reshape(1)
+                p1_init = (-2.0 * g_cur).reshape(1)
+                p2_init = ((B1_c[loc_end] - h2k2[0]) * g_cur - 2.0 * h * f_cur * rho).reshape(1)
+                f_num, g_val, p_history = AcousticRecurrenceFn.apply(
+                    B1_c,
+                    h2k2,
+                    loc,
+                    loc_end - 1,
+                    p1_init,
+                    p2_init,
+                )
+
+                h2k2_layers[layer_idx] = h2k2
+                p1_init_layers[layer_idx] = p1_init
+                p2_init_layers[layer_idx] = p2_init
+                p_history_layers[layer_idx] = p_history
+
+                f_cur = f_num[0] / (2.0 * h * rho)
+                g_cur = g_val[0]
+
+            grad_f_cur = x_m.new_zeros(())
+            grad_g_cur = -torch.ones((), dtype=torch.complex128, device=x_m.device)
+            dDelta_dx = x_m.new_zeros(())
+            grad_B1_delta = torch.zeros_like(B1_c)
+
+            for layer_idx in range(n_layers):
+                h = layer_h[layer_idx]
+                rho = layer_rho[layer_idx]
+                loc = int(layer_loc[layer_idx].item())
+                n_pts = int(layer_n[layer_idx].item())
+                loc_end = loc + n_pts - 1
+                g_in = g_in_layers[layer_idx]
+
+                grad_f_num = (grad_f_cur / (2.0 * h * rho)).reshape(1)
+                grad_g_val = grad_g_cur.reshape(1)
+
+                grad_B1_layer, grad_h2k2_layer, grad_p1i_layer, grad_p2i_layer = (
+                    _run_recurrence_bwd(
+                        grad_f_num,
+                        grad_g_val,
+                        B1_c,
+                        h2k2_layers[layer_idx],
+                        p_history_layers[layer_idx],
+                        loc,
+                        loc_end - 1,
+                        p1_init_layers[layer_idx],
+                        p2_init_layers[layer_idx],
+                        True,
+                    )
+                )
+
+                grad_B1_delta += grad_B1_layer
+                grad_B1_delta[loc_end] += grad_p2i_layer[0] * g_in
+
+                grad_h2k2_total = grad_h2k2_layer[0] - grad_p2i_layer[0] * g_in
+                dDelta_dx = dDelta_dx + grad_h2k2_total * (h * h)
+
+                grad_f_cur = -2.0 * h * rho * grad_p2i_layer[0]
+                grad_g_cur = (
+                    -2.0 * grad_p1i_layer[0]
+                    + (B1_c[loc_end] - h2k2_layers[layer_idx][0]) * grad_p2i_layer[0]
+                )
+
+            dDelta_dx = dDelta_dx + grad_f_cur * dfdx_bot
+            dDelta_dc = grad_f_cur * dfdc_bot
+            dDelta_drho = grad_g_cur
+
+            ift_scale = -grad_x[m].conj() * _lorentz_inv(dDelta_dx, eps)
+            grad_B1_total = grad_B1_total + (ift_scale * grad_B1_delta).real.to(B1.dtype)
+            grad_c_bot = grad_c_bot + (ift_scale * dDelta_dc).real.to(c_bot.dtype)
+            grad_rho_bot = grad_rho_bot + (ift_scale * dDelta_drho).real.to(rho_bot.dtype)
+
+        return (
+            None,
+            grad_B1_total,
+            None,
+            None,
+            None,
+            None,
+            grad_c_bot,
+            grad_rho_bot,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def krakenc_vacuum_acoustic_bottom_ift(
+    x_converged: torch.Tensor,
+    B1: torch.Tensor,
+    layer_h: torch.Tensor,
+    layer_rho: torch.Tensor,
+    layer_loc: torch.Tensor,
+    layer_n: torch.Tensor,
+    c_bot: torch.Tensor,
+    rho_bot: torch.Tensor,
+    omega2: float,
+    c_imag: float,
+    dc_imag_dc: float,
+    *,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    return KrakencVacuumAcousticBottomIFT.apply(
+        x_converged,
+        B1,
+        layer_h,
+        layer_rho,
+        layer_loc,
+        layer_n,
+        c_bot,
+        rho_bot,
+        omega2,
+        c_imag,
+        dc_imag_dc,
+        eps,
+    )
+
+
+__all__ = [
+    "KrakenEigenvalueIFT",
+    "kraken_eigenvalue_ift",
+    "kraken_multilayer_ift",
+    "kraken_acoustic_bottom_ift",
+    "krakenc_vacuum_acoustic_bottom_ift",
+]
