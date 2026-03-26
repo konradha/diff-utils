@@ -99,6 +99,23 @@ def test_solve_tridiag_batch_matches_single():
         assert torch.allclose(x_batch[m], x_single, atol=1e-13), f"mode {m}"
 
 
+def test_solve_tridiag_batch_complex_matches_single():
+    N = 128
+    M = 12
+    e = (torch.randn(N - 1, dtype=torch.float64) * 0.1).to(torch.complex128)
+    e = e + 1j * (torch.randn(N - 1, dtype=torch.float64) * 0.1)
+    d_batch = (torch.randn(M, N, dtype=torch.float64) + 5.0).to(torch.complex128)
+    d_batch = d_batch + 1j * (torch.randn(M, N, dtype=torch.float64) * 0.05)
+    b_batch = torch.randn(M, N, dtype=torch.float64).to(torch.complex128)
+    b_batch = b_batch + 1j * torch.randn(M, N, dtype=torch.float64)
+
+    x_batch = solve_tridiag_batch(e, d_batch, e, b_batch)
+
+    for m in range(M):
+        x_single = solve_tridiag(e, d_batch[m], e, b_batch[m])
+        assert torch.allclose(x_batch[m], x_single, atol=1e-12), f"mode {m}"
+
+
 def test_solve_tridiag_batch_large():
     N = 7501
     M = 192

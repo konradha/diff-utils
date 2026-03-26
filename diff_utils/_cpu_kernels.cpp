@@ -1080,6 +1080,260 @@ acoustic_solve2(torch::Tensor B1, torch::Tensor layer_loc_t,
   return std::make_tuple(eigenvalues, M);
 }
 
+// --- Batched inverse iteration (avoids repeated allocations) ---
+
+torch::Tensor tridiag_inverse_iteration_batch_cpp(
+    torch::Tensor d_batch,   // [M, N]
+    torch::Tensor e,         // [N-1]
+    int64_t n_iter
+) {
+  TORCH_CHECK(d_batch.dim() == 2, "d_batch must be 2D");
+  TORCH_CHECK(e.dim() == 1, "e must be 1D");
+  const int64_t M = d_batch.size(0);
+  const int64_t N = d_batch.size(1);
+  TORCH_CHECK(e.size(0) == N - 1, "e must have N-1 elements");
+
+  if (N < 3) {
+    double inv_sqrt_n = 1.0 / std::sqrt((double)N);
+    return torch::full({M, N}, inv_sqrt_n, d_batch.options());
+  }
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kComplexFloat, at::kComplexDouble, d_batch.scalar_type(),
+      "tridiag_inverse_iteration_batch", [&] {
+        // Nothing here — dispatch needed for the lambda below
+      });
+
+  // Work buffers: one dw clone, one phi
+  auto dw = torch::empty_like(d_batch);
+  auto phi = torch::full({M, N}, 1e-10, d_batch.options());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kComplexFloat, at::kComplexDouble, d_batch.scalar_type(),
+      "tridiag_inverse_iteration_batch_inner", [&] {
+        const scalar_t *RESTRICT d_src = d_batch.data_ptr<scalar_t>();
+        const scalar_t *RESTRICT ep = e.data_ptr<scalar_t>();
+
+        for (int64_t iter = 0; iter < n_iter; ++iter) {
+          // Copy d_batch → dw (reuse allocation)
+          std::memcpy(dw.data_ptr<scalar_t>(), d_src, M * N * sizeof(scalar_t));
+          scalar_t *RESTRICT dwp = dw.data_ptr<scalar_t>();
+          scalar_t *RESTRICT pp = phi.data_ptr<scalar_t>();
+
+          // Batched Thomas solve: dw*phi_new = phi_old (in-place)
+          at::parallel_for(0, M, 1, [&](int64_t m0, int64_t m1) {
+            for (int64_t m = m0; m < m1; ++m) {
+              scalar_t *RESTRICT dm = dwp + m * N;
+              scalar_t *RESTRICT pm = pp + m * N;
+
+              // Forward elimination
+              for (int64_t i = 1; i < N; ++i) {
+                scalar_t w = ep[i - 1] / dm[i - 1];
+                dm[i] -= w * ep[i - 1];
+                pm[i] -= w * pm[i - 1];
+              }
+              // Back substitution
+              pm[N - 1] /= dm[N - 1];
+              for (int64_t i = N - 2; i >= 0; --i) {
+                pm[i] = (pm[i] - ep[i] * pm[i + 1]) / dm[i];
+              }
+
+              // Normalize by max abs
+              double max_abs = 0.0;
+              for (int64_t i = 0; i < N; ++i) {
+                double a = std::abs(pm[i]);
+                if (a > max_abs) max_abs = a;
+              }
+              if (max_abs > 0.0) {
+                scalar_t inv_max = scalar_t(1.0 / max_abs);
+                for (int64_t i = 0; i < N; ++i) pm[i] *= inv_max;
+              }
+            }
+          });
+        }
+
+        // Final L2 normalization
+        scalar_t *RESTRICT pp = phi.data_ptr<scalar_t>();
+        at::parallel_for(0, M, 1, [&](int64_t m0, int64_t m1) {
+          for (int64_t m = m0; m < m1; ++m) {
+            scalar_t *RESTRICT pm = pp + m * N;
+            double sq_sum = 0.0;
+            for (int64_t i = 0; i < N; ++i) {
+              double a = std::abs(pm[i]);
+              sq_sum += a * a;
+            }
+            double norm = std::sqrt(sq_sum);
+            if (norm > 0.0) {
+              scalar_t inv_norm = scalar_t(1.0 / norm);
+              for (int64_t i = 0; i < N; ++i) pm[i] *= inv_norm;
+            }
+          }
+        });
+      });
+
+  return phi;
+}
+
+// --- Complex batched dispersion (no p_history allocation) ---
+
+static inline void bc_impedance_complex(
+    c10::complex<double> x, double omega2,
+    double cp_r, double c_imag_p, double cs_r, double c_imag_s,
+    double rho, int bc_type, bool is_top,
+    c10::complex<double> branch_sign,
+    c10::complex<double> &f, c10::complex<double> &g) {
+
+  using C = c10::complex<double>;
+  if (bc_type == 0 || rho == 0.0) { f = C(1.0, 0.0); g = C(0.0, 0.0); }
+  else if (bc_type == 1 || rho >= 1e10) { f = C(0.0, 0.0); g = C(1.0, 0.0); }
+  else if (cs_r > 0.0) {
+    C cp_c(cp_r, c_imag_p), cs_c(cs_r, c_imag_s);
+    C gammaS2 = x - omega2 / (cs_c * cs_c);
+    C gammaP2 = x - omega2 / (cp_c * cp_c);
+    C gammaS = std::sqrt(gammaS2);
+    C gammaP = std::sqrt(gammaP2);
+    C mu = rho * cs_c * cs_c;
+    f = omega2 * gammaP * (x - gammaS2);
+    g = ((gammaS2 + x) * (gammaS2 + x) - C(4.0) * gammaS * gammaP * x) * mu;
+  } else {
+    C cp_c(cp_r, c_imag_p);
+    C gamma2 = x - omega2 / (cp_c * cp_c);
+    f = branch_sign * std::sqrt(gamma2);
+    g = C(rho, 0.0);
+  }
+  if (is_top) g = -g;
+}
+
+torch::Tensor dispersion_complex_batch_cpp(
+    torch::Tensor x_batch,      // [M] complex128
+    torch::Tensor B1,            // [N] float64 or complex128
+    torch::Tensor layer_loc,     // [n_layers] int64
+    torch::Tensor layer_n,       // [n_layers] int64
+    torch::Tensor layer_h,       // [n_layers] float64
+    torch::Tensor layer_rho,     // [n_layers] float64
+    double omega2,
+    // bottom BC params
+    int64_t bc_bot_type, double bot_cp, double bot_c_imag_p,
+    double bot_cs, double bot_c_imag_s, double bot_rho,
+    // top BC params
+    int64_t bc_top_type, double top_cp, double top_c_imag_p,
+    double top_cs, double top_c_imag_s, double top_rho,
+    // branch signs per mode
+    torch::Tensor branch_signs   // [M] float64
+) {
+  using C = c10::complex<double>;
+  const int64_t M = x_batch.size(0);
+  const int64_t n_layers = layer_loc.size(0);
+
+  auto delta_out = torch::empty({M}, torch::dtype(torch::kComplexDouble));
+  C *RESTRICT delta_p = reinterpret_cast<C *>(delta_out.data_ptr());
+  const C *RESTRICT xp = reinterpret_cast<const C *>(x_batch.data_ptr());
+  const double *RESTRICT b1 = B1.data_ptr<double>();
+  const int64_t *RESTRICT ll = layer_loc.data_ptr<int64_t>();
+  const int64_t *RESTRICT ln = layer_n.data_ptr<int64_t>();
+  const double *RESTRICT lh = layer_h.data_ptr<double>();
+  const double *RESTRICT lr = layer_rho.data_ptr<double>();
+  const double *RESTRICT bsigns = branch_signs.data_ptr<double>();
+
+  at::parallel_for(0, M, 1, [&](int64_t m0, int64_t m1) {
+    for (int64_t m = m0; m < m1; ++m) {
+      C x = xp[m];
+      C bsign(bsigns[m], 0.0);
+      C f, g;
+      bc_impedance_complex(x, omega2, bot_cp, bot_c_imag_p,
+                           bot_cs, bot_c_imag_s, bot_rho,
+                           bc_bot_type, false, bsign, f, g);
+
+      for (int64_t li = n_layers - 1; li >= 0; --li) {
+        double h = lh[li];
+        C h2k2 = h * h * x;
+        double rho = lr[li];
+        int64_t loc_s = ll[li];
+        int64_t loc_e = loc_s + ln[li] - 1;
+
+        C p1 = C(-2.0) * g;
+        C p2 = (C(b1[loc_e]) - h2k2) * g - C(2.0 * h) * f * C(rho);
+        C p0 = p1;
+
+        int64_t sweep_len = loc_e - 1 - loc_s + 1;
+        for (int64_t s = 0; s < sweep_len; ++s) {
+          int64_t jj = (loc_e - 1) - s;
+          p0 = p1;
+          p1 = p2;
+          p2 = (h2k2 - C(b1[jj])) * p1 - p0;
+        }
+        f = -(p2 - p0) / C(2.0 * h * rho);
+        g = -p1;
+      }
+
+      C f_top, g_top;
+      bc_impedance_complex(x, omega2, top_cp, top_c_imag_p,
+                           top_cs, top_c_imag_s, top_rho,
+                           bc_top_type, true, C(1.0), f_top, g_top);
+      delta_p[m] = f * g_top - g * f_top;
+    }
+  });
+  return delta_out;
+}
+
+// Single-x wrapper for scalar dispersion_complex (avoids tensor overhead)
+c10::complex<double> dispersion_complex_scalar_cpp(
+    c10::complex<double> x,
+    torch::Tensor B1,
+    torch::Tensor layer_loc,
+    torch::Tensor layer_n,
+    torch::Tensor layer_h,
+    torch::Tensor layer_rho,
+    double omega2,
+    int64_t bc_bot_type, double bot_cp, double bot_c_imag_p,
+    double bot_cs, double bot_c_imag_s, double bot_rho,
+    int64_t bc_top_type, double top_cp, double top_c_imag_p,
+    double top_cs, double top_c_imag_s, double top_rho,
+    double branch_sign
+) {
+  using C = c10::complex<double>;
+  const int64_t n_layers = layer_loc.size(0);
+  const double *RESTRICT b1 = B1.data_ptr<double>();
+  const int64_t *RESTRICT ll = layer_loc.data_ptr<int64_t>();
+  const int64_t *RESTRICT ln = layer_n.data_ptr<int64_t>();
+  const double *RESTRICT lh = layer_h.data_ptr<double>();
+  const double *RESTRICT lr = layer_rho.data_ptr<double>();
+
+  C bsign(branch_sign, 0.0);
+  C f, g;
+  bc_impedance_complex(x, omega2, bot_cp, bot_c_imag_p,
+                       bot_cs, bot_c_imag_s, bot_rho,
+                       bc_bot_type, false, bsign, f, g);
+
+  for (int64_t li = n_layers - 1; li >= 0; --li) {
+    double h = lh[li];
+    C h2k2 = h * h * x;
+    double rho = lr[li];
+    int64_t loc_s = ll[li];
+    int64_t loc_e = loc_s + ln[li] - 1;
+
+    C p1 = C(-2.0) * g;
+    C p2 = (C(b1[loc_e]) - h2k2) * g - C(2.0 * h) * f * C(rho);
+    C p0 = p1;
+
+    int64_t sweep_len = loc_e - 1 - loc_s + 1;
+    for (int64_t s = 0; s < sweep_len; ++s) {
+      int64_t jj = (loc_e - 1) - s;
+      p0 = p1;
+      p1 = p2;
+      p2 = (h2k2 - C(b1[jj])) * p1 - p0;
+    }
+    f = -(p2 - p0) / C(2.0 * h * rho);
+    g = -p1;
+  }
+
+  C f_top, g_top;
+  bc_impedance_complex(x, omega2, top_cp, top_c_imag_p,
+                       top_cs, top_c_imag_s, top_rho,
+                       bc_top_type, true, C(1.0), f_top, g_top);
+  return f * g_top - g * f_top;
+}
+
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1098,4 +1352,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &acoustic_recurrence_scalar_counted);
   m.def("acoustic_solve1", &acoustic_solve1);
   m.def("acoustic_solve2", &acoustic_solve2);
+  m.def("dispersion_complex_batch", &dispersion_complex_batch_cpp);
+  m.def("dispersion_complex_scalar", &dispersion_complex_scalar_cpp);
+  m.def("tridiag_inverse_iteration_batch", &tridiag_inverse_iteration_batch_cpp);
 }

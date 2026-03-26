@@ -10,7 +10,7 @@ def solve_tridiag(
     b: torch.Tensor,
 ) -> torch.Tensor:
     ext = _cpu_ext()
-    if ext is not None and not (dl.is_complex() or d.is_complex() or du.is_complex() or b.is_complex()):
+    if ext is not None:
         return ext.solve_tridiag(
             dl.contiguous(),
             d.contiguous(),
@@ -27,20 +27,14 @@ def solve_tridiag_batch(
     b_batch: torch.Tensor,
 ) -> torch.Tensor:
     ext = _cpu_ext()
-    if ext is not None and not (
-        dl.is_complex() or d_batch.is_complex() or du.is_complex() or b_batch.is_complex()
-    ):
+    if ext is not None:
         return ext.solve_tridiag_batch(
             dl.contiguous(),
             d_batch.contiguous(),
             du.contiguous(),
             b_batch.contiguous(),
         )
-    M = d_batch.shape[0]
-    results = []
-    for m in range(M):
-        results.append(_solve_tridiag_python(dl, d_batch[m], du, b_batch[m]))
-    return torch.stack(results)
+    return _solve_tridiag_batch_python(dl, d_batch, du, b_batch)
 
 
 def tridiag_inverse_iteration(
@@ -77,6 +71,12 @@ def tridiag_inverse_iteration_batch(
     if N < 3:
         return torch.ones(M, N, dtype=d_batch.dtype) / (N**0.5)
 
+    ext = _cpu_ext()
+    if ext is not None and hasattr(ext, 'tridiag_inverse_iteration_batch'):
+        return ext.tridiag_inverse_iteration_batch(
+            d_batch.contiguous(), e.contiguous(), n_iter,
+        )
+
     phi = torch.full((M, N), 1e-10, dtype=d_batch.dtype)
     for _ in range(n_iter):
         phi = solve_tridiag_batch(e, d_batch, e, phi)
@@ -104,6 +104,20 @@ def _solve_tridiag_python(dl, d, du, b):
     x[N - 1] = x[N - 1] / dw[N - 1]
     for i in range(N - 2, -1, -1):
         x[i] = (x[i] - du[i] * x[i + 1]) / dw[i]
+    return x
+
+
+def _solve_tridiag_batch_python(dl, d_batch, du, b_batch):
+    M, N = d_batch.shape
+    dw = d_batch.clone()
+    x = b_batch.clone()
+    for i in range(1, N):
+        w = dl[i - 1] / dw[:, i - 1]
+        dw[:, i] = dw[:, i] - w * du[i - 1]
+        x[:, i] = x[:, i] - w * x[:, i - 1]
+    x[:, N - 1] = x[:, N - 1] / dw[:, N - 1]
+    for i in range(N - 2, -1, -1):
+        x[:, i] = (x[:, i] - du[i] * x[:, i + 1]) / dw[:, i]
     return x
 
 

@@ -1,6 +1,7 @@
 import torch
 
 from diff_utils.solve_banded import make_banded_csr, solve_banded
+from diff_utils.solve_tridiag import solve_tridiag, solve_tridiag_batch
 
 
 class EigvecReattachFn(torch.autograd.Function):
@@ -466,21 +467,14 @@ def tridiag_eigvec_adjoint(
     tol: float = 1e-10,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     phi_ref = phi.detach()
-    grad_phi_ref = grad_phi
 
     sigma_m = _rayleigh_quotient(phi_ref, d_vals.detach(), e_vals.detach()).real.to(d_vals.dtype)
-    g = _project_orthogonal(grad_phi_ref, phi_ref)
+    g = _project_orthogonal(grad_phi, phi_ref)
 
-    lam, _, _, _ = _cg_solve_normal_equation(
-        phi_ref.unsqueeze(0),
-        d_vals,
-        e_vals,
-        sigma_m,
-        g,
-        max_iter=max_iter,
-        tol=tol,
-        reg=max(eps * eps, 1e-14),
-    )
+    reg = max(eps * eps, 1e-14)
+    shifted_d = d_vals.detach() - sigma_m + reg
+    lam = solve_tridiag(e_vals.detach(), shifted_d, e_vals.detach(), g)
+    lam = _project_orthogonal(lam, phi_ref)
 
     grad_d_out = -lam * phi_ref
     grad_e_out = -lam[:-1] * phi_ref[1:] - lam[1:] * phi_ref[:-1]
@@ -673,21 +667,48 @@ class TridiagEigvecVaryingBatchAdjointFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_phi_batch):
         phi_batch, d_batch, e_batch = ctx.saved_tensors
-        M = phi_batch.shape[0]
+        M, N = phi_batch.shape
+        tau = ctx.tau
+
         grad_d_batch = torch.zeros_like(d_batch)
         grad_e_batch = torch.zeros_like(e_batch)
 
         for m in range(M):
-            grad_d_m, grad_e_m = tridiag_eigvec_adjoint(
-                phi_batch[m],
-                d_batch[m],
-                e_batch[m],
-                grad_phi_batch[m],
-                tau=ctx.tau,
-                eps=ctx.eps,
-            )
-            grad_d_batch[m] = grad_d_m
-            grad_e_batch[m] = grad_e_m
+            phi_m = phi_batch[m]
+            d_m = d_batch[m]
+            e_m = e_batch[m]
+            g_m = grad_phi_batch[m]
+
+            # Rayleigh quotient
+            Tphi = d_m * phi_m
+            Tphi[:-1] += phi_m[1:] * e_m
+            Tphi[1:] += phi_m[:-1] * e_m
+            if phi_m.is_complex():
+                sigma = (phi_m.conj() * Tphi).sum().real
+            else:
+                sigma = (phi_m * Tphi).sum()
+
+            # Project gradient orthogonal to phi
+            if phi_m.is_complex():
+                coeff = (phi_m.conj() * g_m).sum()
+            else:
+                coeff = (phi_m * g_m).sum()
+            g_orth = g_m - coeff * phi_m
+
+            # Direct regularized solve: (T - sigma + reg) lam = g_orth
+            reg = max(ctx.eps * ctx.eps, 1e-14)
+            shifted_d = d_m - sigma.to(d_m.dtype) + reg
+            lam = solve_tridiag(e_m, shifted_d, e_m, g_orth)
+
+            # Project lambda orthogonal to phi
+            if phi_m.is_complex():
+                coeff2 = (phi_m.conj() * lam).sum()
+            else:
+                coeff2 = (phi_m * lam).sum()
+            lam = lam - coeff2 * phi_m
+
+            grad_d_batch[m] = -lam * phi_m
+            grad_e_batch[m] = -lam[:-1] * phi_m[1:] - lam[1:] * phi_m[:-1]
 
         return None, grad_d_batch, grad_e_batch, None, None
 
