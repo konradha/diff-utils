@@ -761,6 +761,7 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
         layer_rho: torch.Tensor,
         layer_loc: torch.Tensor,
         layer_n: torch.Tensor,
+        branch_signs: torch.Tensor,
         c_bot: torch.Tensor,
         rho_bot: torch.Tensor,
         omega2: float,
@@ -779,6 +780,7 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
             layer_rho,
             layer_loc,
             layer_n,
+            branch_signs,
             c_bot,
             rho_bot,
             omega2,
@@ -797,6 +799,7 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
             layer_rho,
             layer_loc,
             layer_n,
+            branch_signs,
             c_bot,
             rho_bot,
         )
@@ -810,6 +813,7 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
             layer_rho,
             layer_loc,
             layer_n,
+            branch_signs,
             c_bot,
             rho_bot,
         ) = ctx.saved_tensors
@@ -843,11 +847,13 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
 
         for m in range(M):
             x_m = x_converged[m].detach().to(torch.complex128)
+            branch_sign = branch_signs[m].detach().to(torch.complex128)
             gamma2 = x_m - omega2 / (cp_c * cp_c)
-            f_bot = torch.sqrt(gamma2)
+            f_sqrt = torch.sqrt(gamma2)
+            f_bot = branch_sign * f_sqrt
             g_bot = rho_bot.detach().to(torch.complex128)
-            dfdx_bot = 0.5 / f_bot
-            dfdcp = omega2 / (cp_c * cp_c * cp_c * f_bot)
+            dfdx_bot = branch_sign * 0.5 / f_sqrt
+            dfdcp = branch_sign * omega2 / (cp_c * cp_c * cp_c * f_sqrt)
             dfdc_bot = dfdcp * dcp_dc
 
             f_cur = f_bot
@@ -943,6 +949,7 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
             None,
             None,
             None,
+            None,
             grad_c_bot,
             grad_rho_bot,
             None,
@@ -959,6 +966,7 @@ def krakenc_vacuum_acoustic_bottom_ift(
     layer_rho: torch.Tensor,
     layer_loc: torch.Tensor,
     layer_n: torch.Tensor,
+    branch_signs: torch.Tensor,
     c_bot: torch.Tensor,
     rho_bot: torch.Tensor,
     omega2: float,
@@ -974,6 +982,7 @@ def krakenc_vacuum_acoustic_bottom_ift(
         layer_rho,
         layer_loc,
         layer_n,
+        branch_signs,
         c_bot,
         rho_bot,
         omega2,

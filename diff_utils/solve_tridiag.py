@@ -10,7 +10,7 @@ def solve_tridiag(
     b: torch.Tensor,
 ) -> torch.Tensor:
     ext = _cpu_ext()
-    if ext is not None:
+    if ext is not None and not (dl.is_complex() or d.is_complex() or du.is_complex() or b.is_complex()):
         return ext.solve_tridiag(
             dl.contiguous(),
             d.contiguous(),
@@ -27,7 +27,9 @@ def solve_tridiag_batch(
     b_batch: torch.Tensor,
 ) -> torch.Tensor:
     ext = _cpu_ext()
-    if ext is not None:
+    if ext is not None and not (
+        dl.is_complex() or d_batch.is_complex() or du.is_complex() or b_batch.is_complex()
+    ):
         return ext.solve_tridiag_batch(
             dl.contiguous(),
             d_batch.contiguous(),
@@ -57,8 +59,11 @@ def tridiag_inverse_iteration(
         if norm > 0:
             phi = phi / norm
 
-    norm = torch.sqrt(torch.dot(phi, phi))
-    if norm > 0:
+    if phi.is_complex():
+        norm = torch.sqrt((phi.abs() ** 2).sum())
+    else:
+        norm = torch.sqrt(torch.dot(phi, phi))
+    if norm.abs() > 0:
         phi = phi / norm
     return phi
 
@@ -79,8 +84,11 @@ def tridiag_inverse_iteration_batch(
         norms = norms.clamp(min=1e-30)
         phi = phi / norms
 
-    norms = torch.sqrt((phi * phi).sum(dim=1, keepdim=True))
-    norms = norms.clamp(min=1e-30)
+    if phi.is_complex():
+        norms = torch.sqrt((phi.abs() ** 2).sum(dim=1, keepdim=True))
+    else:
+        norms = torch.sqrt((phi * phi).sum(dim=1, keepdim=True))
+    norms = norms.abs().clamp(min=1e-30)
     phi = phi / norms
     return phi
 
