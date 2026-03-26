@@ -512,18 +512,12 @@ def tridiag_eigvec_cluster_adjoint(
     grad_e = torch.zeros_like(e_vals)
     basis_eff = _orthonormalize_basis(Phi_eff)
 
+    reg = max(eps * eps, 1e-14)
     for i in range(Phi_eff.shape[0]):
         rhs = _project_orthogonal_subspace(grad_phi_eff[i], basis_eff)
-        lam, _, _, _ = _cg_solve_normal_equation(
-            basis_eff,
-            d_vals,
-            e_vals,
-            sigma_eff[i].real.to(d_vals.dtype),
-            rhs,
-            max_iter=max_iter,
-            tol=tol,
-            reg=max(eps * eps, 1e-14),
-        )
+        shifted_d = d_vals.detach() - sigma_eff[i].real.to(d_vals.dtype) + reg
+        lam = solve_tridiag(e_vals.detach(), shifted_d, e_vals.detach(), rhs)
+        lam = _project_orthogonal_subspace(lam, basis_eff)
         phi_i = Phi_eff[i]
         grad_d = grad_d - lam * phi_i
         grad_e = grad_e - lam[:-1] * phi_i[1:] - lam[1:] * phi_i[:-1]
@@ -654,21 +648,30 @@ class TridiagEigvecClusterAdjointFn(torch.autograd.Function):
 
 class TridiagEigvecVaryingBatchAdjointFn(torch.autograd.Function):
     @staticmethod
-    def forward(phi_batch, d_batch, e_batch, tau, eps):
+    def forward(phi_batch, d_batch, e_batch, tau, eps, sigmas=None):
         return phi_batch.detach().clone()
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        phi_batch, d_batch, e_batch, tau, eps = inputs
+        phi_batch, d_batch, e_batch, tau, eps, sigmas = inputs
         ctx.tau = tau
         ctx.eps = eps
-        ctx.save_for_backward(phi_batch, d_batch, e_batch)
+        if sigmas is not None:
+            ctx.save_for_backward(phi_batch, d_batch, e_batch, sigmas)
+            ctx.has_sigmas = True
+        else:
+            ctx.save_for_backward(phi_batch, d_batch, e_batch)
+            ctx.has_sigmas = False
 
     @staticmethod
     def backward(ctx, grad_phi_batch):
-        phi_batch, d_batch, e_batch = ctx.saved_tensors
+        if ctx.has_sigmas:
+            phi_batch, d_batch, e_batch, sigmas_saved = ctx.saved_tensors
+        else:
+            phi_batch, d_batch, e_batch = ctx.saved_tensors
+            sigmas_saved = None
         M, N = phi_batch.shape
-        tau = ctx.tau
+        reg = max(ctx.eps * ctx.eps, 1e-14)
 
         grad_d_batch = torch.zeros_like(d_batch)
         grad_e_batch = torch.zeros_like(e_batch)
@@ -679,38 +682,52 @@ class TridiagEigvecVaryingBatchAdjointFn(torch.autograd.Function):
             e_m = e_batch[m]
             g_m = grad_phi_batch[m]
 
-            # Rayleigh quotient
-            Tphi = d_m * phi_m
-            Tphi[:-1] += phi_m[1:] * e_m
-            Tphi[1:] += phi_m[:-1] * e_m
+            # Unit-normalize phi for the projection and solve to avoid
+            # ill-conditioning from the near-singular (T-sigma) system.
+            # Porter-normalized phi has ||phi||^2 != 1, which leaves a
+            # residual null-space component that the near-singular solve
+            # amplifies catastrophically. We solve in the unit-norm basis
+            # then map the gradient back to the Porter-normalized convention.
             if phi_m.is_complex():
-                sigma = (phi_m.conj() * Tphi).sum().real
+                phi_sq_norm = (phi_m.conj() * phi_m).sum().real
             else:
-                sigma = (phi_m * Tphi).sum()
+                phi_sq_norm = (phi_m * phi_m).sum()
+            phi_hat = phi_m / phi_sq_norm.sqrt().clamp(min=1e-30)
 
-            # Project gradient orthogonal to phi
-            if phi_m.is_complex():
-                coeff = (phi_m.conj() * g_m).sum()
+            if sigmas_saved is not None:
+                sigma = sigmas_saved[m]
             else:
-                coeff = (phi_m * g_m).sum()
-            g_orth = g_m - coeff * phi_m
+                Tphi = d_m * phi_hat
+                Tphi[:-1] += phi_hat[1:] * e_m
+                Tphi[1:] += phi_hat[:-1] * e_m
+                if phi_hat.is_complex():
+                    sigma = (phi_hat.conj() * Tphi).sum().real
+                else:
+                    sigma = (phi_hat * Tphi).sum()
 
-            # Direct regularized solve: (T - sigma + reg) lam = g_orth
-            reg = max(ctx.eps * ctx.eps, 1e-14)
+            # Project gradient orthogonal to unit-norm phi
+            if phi_hat.is_complex():
+                coeff = (phi_hat.conj() * g_m).sum()
+            else:
+                coeff = (phi_hat * g_m).sum()
+            g_orth = g_m - coeff * phi_hat
+
             shifted_d = d_m - sigma.to(d_m.dtype) + reg
             lam = solve_tridiag(e_m, shifted_d, e_m, g_orth)
-
-            # Project lambda orthogonal to phi
-            if phi_m.is_complex():
-                coeff2 = (phi_m.conj() * lam).sum()
+            if phi_hat.is_complex():
+                coeff2 = (phi_hat.conj() * lam).sum()
             else:
-                coeff2 = (phi_m * lam).sum()
-            lam = lam - coeff2 * phi_m
+                coeff2 = (phi_hat * lam).sum()
+            lam = lam - coeff2 * phi_hat
 
+            # Gradient uses original phi_m (Porter normalization).
+            # lam was solved with unit-norm projection for stability,
+            # but grad_d = -lam * phi_m is the correct chain rule for
+            # the eigenvector perturbation of the non-unit eigenvector.
             grad_d_batch[m] = -lam * phi_m
             grad_e_batch[m] = -lam[:-1] * phi_m[1:] - lam[1:] * phi_m[:-1]
 
-        return None, grad_d_batch, grad_e_batch, None, None
+        return None, grad_d_batch, grad_e_batch, None, None, None
 
 
 def tridiag_eigvec_reattach(
@@ -741,8 +758,9 @@ def tridiag_eigvec_reattach_varying_batch(
     *,
     tau: float = 1e-8,
     eps: float = 1e-10,
+    sigmas: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return TridiagEigvecVaryingBatchAdjointFn.apply(phi_batch, d_batch, e_batch, tau, eps)
+    return TridiagEigvecVaryingBatchAdjointFn.apply(phi_batch, d_batch, e_batch, tau, eps, sigmas)
 
 
 __all__ = [

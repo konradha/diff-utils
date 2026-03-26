@@ -1080,7 +1080,7 @@ acoustic_solve2(torch::Tensor B1, torch::Tensor layer_loc_t,
   return std::make_tuple(eigenvalues, M);
 }
 
-// --- Batched inverse iteration (avoids repeated allocations) ---
+// --- Batched inverse iteration (per-mode local buffer, cache-friendly) ---
 
 torch::Tensor tridiag_inverse_iteration_batch_cpp(
     torch::Tensor d_batch,   // [M, N]
@@ -1098,14 +1098,6 @@ torch::Tensor tridiag_inverse_iteration_batch_cpp(
     return torch::full({M, N}, inv_sqrt_n, d_batch.options());
   }
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::kComplexFloat, at::kComplexDouble, d_batch.scalar_type(),
-      "tridiag_inverse_iteration_batch", [&] {
-        // Nothing here — dispatch needed for the lambda below
-      });
-
-  // Work buffers: one dw clone, one phi
-  auto dw = torch::empty_like(d_batch);
   auto phi = torch::full({M, N}, 1e-10, d_batch.options());
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -1113,29 +1105,29 @@ torch::Tensor tridiag_inverse_iteration_batch_cpp(
       "tridiag_inverse_iteration_batch_inner", [&] {
         const scalar_t *RESTRICT d_src = d_batch.data_ptr<scalar_t>();
         const scalar_t *RESTRICT ep = e.data_ptr<scalar_t>();
+        scalar_t *RESTRICT pp = phi.data_ptr<scalar_t>();
 
-        for (int64_t iter = 0; iter < n_iter; ++iter) {
-          // Copy d_batch → dw (reuse allocation)
-          std::memcpy(dw.data_ptr<scalar_t>(), d_src, M * N * sizeof(scalar_t));
-          scalar_t *RESTRICT dwp = dw.data_ptr<scalar_t>();
-          scalar_t *RESTRICT pp = phi.data_ptr<scalar_t>();
+        // Each thread gets its own local dw buffer (size N, fits in L2)
+        at::parallel_for(0, M, 1, [&](int64_t m0, int64_t m1) {
+          std::vector<scalar_t> dw_local(N);
+          for (int64_t m = m0; m < m1; ++m) {
+            const scalar_t *RESTRICT d_m = d_src + m * N;
+            scalar_t *RESTRICT pm = pp + m * N;
 
-          // Batched Thomas solve: dw*phi_new = phi_old (in-place)
-          at::parallel_for(0, M, 1, [&](int64_t m0, int64_t m1) {
-            for (int64_t m = m0; m < m1; ++m) {
-              scalar_t *RESTRICT dm = dwp + m * N;
-              scalar_t *RESTRICT pm = pp + m * N;
+            for (int64_t iter = 0; iter < n_iter; ++iter) {
+              // Copy only this mode's diagonal (N elements, ~1.3MB for 80K complex128)
+              std::memcpy(dw_local.data(), d_m, N * sizeof(scalar_t));
 
               // Forward elimination
               for (int64_t i = 1; i < N; ++i) {
-                scalar_t w = ep[i - 1] / dm[i - 1];
-                dm[i] -= w * ep[i - 1];
+                scalar_t w = ep[i - 1] / dw_local[i - 1];
+                dw_local[i] -= w * ep[i - 1];
                 pm[i] -= w * pm[i - 1];
               }
               // Back substitution
-              pm[N - 1] /= dm[N - 1];
+              pm[N - 1] /= dw_local[N - 1];
               for (int64_t i = N - 2; i >= 0; --i) {
-                pm[i] = (pm[i] - ep[i] * pm[i + 1]) / dm[i];
+                pm[i] = (pm[i] - ep[i] * pm[i + 1]) / dw_local[i];
               }
 
               // Normalize by max abs
@@ -1145,18 +1137,12 @@ torch::Tensor tridiag_inverse_iteration_batch_cpp(
                 if (a > max_abs) max_abs = a;
               }
               if (max_abs > 0.0) {
-                scalar_t inv_max = scalar_t(1.0 / max_abs);
-                for (int64_t i = 0; i < N; ++i) pm[i] *= inv_max;
+                scalar_t inv = scalar_t(1.0 / max_abs);
+                for (int64_t i = 0; i < N; ++i) pm[i] *= inv;
               }
             }
-          });
-        }
 
-        // Final L2 normalization
-        scalar_t *RESTRICT pp = phi.data_ptr<scalar_t>();
-        at::parallel_for(0, M, 1, [&](int64_t m0, int64_t m1) {
-          for (int64_t m = m0; m < m1; ++m) {
-            scalar_t *RESTRICT pm = pp + m * N;
+            // Final L2 normalization
             double sq_sum = 0.0;
             for (int64_t i = 0; i < N; ++i) {
               double a = std::abs(pm[i]);
@@ -1171,6 +1157,91 @@ torch::Tensor tridiag_inverse_iteration_batch_cpp(
         });
       });
 
+  return phi;
+}
+
+// --- Fused assembly + inverse iteration (no d_batch allocation) ---
+
+torch::Tensor fused_assembly_inverse_iteration_cpp(
+    torch::Tensor base_d,       // [N] complex128 — shared base diagonal
+    torch::Tensor h2_factor,    // [N] complex128 — shared h^2/(h*rho) factor
+    torch::Tensor x_batch,      // [M] complex128 — eigenvalues
+    torch::Tensor e,            // [N-1] complex128 — shared off-diagonal
+    torch::Tensor bc_top_ratio, // [M] complex128 — f/g at top per mode
+    torch::Tensor bc_bot_ratio, // [M] complex128 — f/g at bottom per mode
+    torch::Tensor bc_top_vacuum,// [M] bool
+    torch::Tensor bc_bot_vacuum,// [M] bool
+    int64_t n_iter
+) {
+  using C = c10::complex<double>;
+  const int64_t M = x_batch.size(0);
+  const int64_t N = base_d.size(0);
+
+  if (N < 3) {
+    double inv_sqrt_n = 1.0 / std::sqrt((double)N);
+    return torch::full({M, N}, inv_sqrt_n, base_d.options());
+  }
+
+  auto phi = torch::full({M, N}, C(1e-10), base_d.options());
+
+  const C *RESTRICT bd = reinterpret_cast<const C*>(base_d.data_ptr());
+  const C *RESTRICT hf = reinterpret_cast<const C*>(h2_factor.data_ptr());
+  const C *RESTRICT xp = reinterpret_cast<const C*>(x_batch.data_ptr());
+  const C *RESTRICT ep = reinterpret_cast<const C*>(e.data_ptr());
+  const C *RESTRICT tr = reinterpret_cast<const C*>(bc_top_ratio.data_ptr());
+  const C *RESTRICT br = reinterpret_cast<const C*>(bc_bot_ratio.data_ptr());
+  const bool *RESTRICT tv = bc_top_vacuum.data_ptr<bool>();
+  const bool *RESTRICT bv = bc_bot_vacuum.data_ptr<bool>();
+  C *RESTRICT pp = reinterpret_cast<C*>(phi.data_ptr());
+
+  at::parallel_for(0, M, 1, [&](int64_t m0, int64_t m1) {
+    std::vector<C> dw(N);
+    for (int64_t m = m0; m < m1; ++m) {
+      C x_m = xp[m];
+      C *RESTRICT pm = pp + m * N;
+
+      // Assemble diagonal: d[i] = base_d[i] - x_m * h2_factor[i]
+      for (int64_t i = 0; i < N; ++i)
+        dw[i] = bd[i] - x_m * hf[i];
+
+      // BC injection
+      if (tv[m]) { dw[0] = C(1.0); /* e[0] already 0 in e */ }
+      else       { dw[0] = dw[0] / C(2.0) + tr[m]; }
+      if (bv[m]) { dw[N-1] = C(1.0); }
+      else       { dw[N-1] = dw[N-1] / C(2.0) - br[m]; }
+
+      for (int64_t iter = 0; iter < n_iter; ++iter) {
+        // Restore diagonal (assembly is cheap, avoids copy)
+        if (iter > 0) {
+          for (int64_t i = 0; i < N; ++i)
+            dw[i] = bd[i] - x_m * hf[i];
+          if (tv[m]) dw[0] = C(1.0); else dw[0] = dw[0]/C(2.0) + tr[m];
+          if (bv[m]) dw[N-1] = C(1.0); else dw[N-1] = dw[N-1]/C(2.0) - br[m];
+        }
+
+        // Thomas forward elimination
+        for (int64_t i = 1; i < N; ++i) {
+          C w = ep[i-1] / dw[i-1];
+          dw[i] -= w * ep[i-1];
+          pm[i] -= w * pm[i-1];
+        }
+        pm[N-1] /= dw[N-1];
+        for (int64_t i = N-2; i >= 0; --i)
+          pm[i] = (pm[i] - ep[i] * pm[i+1]) / dw[i];
+
+        // Normalize
+        double mx = 0.0;
+        for (int64_t i = 0; i < N; ++i) { double a = std::abs(pm[i]); if (a > mx) mx = a; }
+        if (mx > 0.0) { C inv(1.0/mx); for (int64_t i = 0; i < N; ++i) pm[i] *= inv; }
+      }
+
+      // Final L2 norm
+      double sq = 0.0;
+      for (int64_t i = 0; i < N; ++i) { double a = std::abs(pm[i]); sq += a*a; }
+      double nrm = std::sqrt(sq);
+      if (nrm > 0.0) { C inv(1.0/nrm); for (int64_t i = 0; i < N; ++i) pm[i] *= inv; }
+    }
+  });
   return phi;
 }
 
@@ -1334,6 +1405,190 @@ c10::complex<double> dispersion_complex_scalar_cpp(
   return f * g_top - g * f_top;
 }
 
+// --- Inline dispersion for the refinement loop ---
+struct DispEnv {
+  const double *b1;
+  int64_t n_layers;
+  const int64_t *ll;
+  const int64_t *ln;
+  const double *lh;
+  const double *lr;
+  double omega2;
+  int64_t bc_bot_type; double bot_cp, bot_ci, bot_cs, bot_csi, bot_rho;
+  int64_t bc_top_type; double top_cp, top_ci, top_cs, top_csi, top_rho;
+};
+
+static inline c10::complex<double> disp_eval(
+    c10::complex<double> x, const DispEnv &E, double branch_sign) {
+  using C = c10::complex<double>;
+  C bsign(branch_sign, 0.0);
+  C f, g;
+  bc_impedance_complex(x, E.omega2, E.bot_cp, E.bot_ci, E.bot_cs, E.bot_csi,
+                       E.bot_rho, E.bc_bot_type, false, bsign, f, g);
+  for (int64_t li = E.n_layers - 1; li >= 0; --li) {
+    double h = E.lh[li];
+    C h2k2 = h * h * x;
+    double rho = E.lr[li];
+    int64_t loc_s = E.ll[li], loc_e = loc_s + E.ln[li] - 1;
+    C p1 = C(-2.0)*g, p2 = (C(E.b1[loc_e])-h2k2)*g - C(2.0*h)*f*C(rho), p0 = p1;
+    for (int64_t s = 0; s < loc_e-1-loc_s+1; ++s) {
+      p0=p1; p1=p2; p2 = (h2k2-C(E.b1[(loc_e-1)-s]))*p1-p0;
+    }
+    f = -(p2-p0)/C(2.0*h*rho); g = -p1;
+  }
+  C ft, gt;
+  bc_impedance_complex(x, E.omega2, E.top_cp, E.top_ci, E.top_cs, E.top_csi,
+                       E.top_rho, E.bc_top_type, true, C(1.0), ft, gt);
+  return f*gt - g*ft;
+}
+
+// Refine M roots: secant + polish + branch selection, all in C++
+std::tuple<torch::Tensor, torch::Tensor> refine_roots_cpp(
+    torch::Tensor x_init_t,    // [M] complex128 — initial guesses from real KRAKEN
+    torch::Tensor k_init_t,    // [M] complex128 — initial k from real KRAKEN
+    torch::Tensor B1,
+    torch::Tensor layer_loc, torch::Tensor layer_n,
+    torch::Tensor layer_h, torch::Tensor layer_rho,
+    double omega2,
+    int64_t bc_bot_type, double bot_cp, double bot_ci,
+    double bot_cs, double bot_csi, double bot_rho,
+    int64_t bc_top_type, double top_cp, double top_ci,
+    double top_cs, double top_csi, double top_rho,
+    double real_k_min, int64_t max_iter
+) {
+  using C = c10::complex<double>;
+  const int64_t M = x_init_t.size(0);
+
+  DispEnv E;
+  E.b1 = B1.data_ptr<double>();
+  E.n_layers = layer_loc.size(0);
+  E.ll = layer_loc.data_ptr<int64_t>();
+  E.ln = layer_n.data_ptr<int64_t>();
+  E.lh = layer_h.data_ptr<double>();
+  E.lr = layer_rho.data_ptr<double>();
+  E.omega2 = omega2;
+  E.bc_bot_type = bc_bot_type; E.bot_cp = bot_cp; E.bot_ci = bot_ci;
+  E.bot_cs = bot_cs; E.bot_csi = bot_csi; E.bot_rho = bot_rho;
+  E.bc_top_type = bc_top_type; E.top_cp = top_cp; E.top_ci = top_ci;
+  E.top_cs = top_cs; E.top_csi = top_csi; E.top_rho = top_rho;
+
+  const C *xi = reinterpret_cast<const C*>(x_init_t.data_ptr());
+  const C *ki = reinterpret_cast<const C*>(k_init_t.data_ptr());
+
+  auto x_out = torch::empty({M}, torch::dtype(torch::kComplexDouble));
+  auto signs_out = torch::empty({M}, torch::dtype(torch::kDouble));
+  C *xo = reinterpret_cast<C*>(x_out.data_ptr());
+  double *so = signs_out.data_ptr<double>();
+
+  // Determine branch signs for all modes (batch: 2 dispersion calls per mode)
+  // Then refine each mode independently
+  at::parallel_for(0, M, 1, [&](int64_t m0, int64_t m1) {
+    for (int64_t m = m0; m < m1; ++m) {
+      C x0 = xi[m];
+      C k_init = ki[m];
+
+      // Branch sign selection
+      double resid_pos = std::abs(disp_eval(x0, E, 1.0));
+      double resid_neg = std::abs(disp_eval(x0, E, -1.0));
+      double default_sign = (resid_neg < resid_pos) ? -1.0 : 1.0;
+
+      // Refine with both branches, pick best
+      auto do_refine = [&](double bsign) -> C {
+        C x_a = x0;
+        double sc = std::max(std::abs(x_a), 1.0);
+        C x_b = x_a * C(1.0+1e-8, 1e-8) + C(0.0, 1e-10*sc);
+        C f_a = disp_eval(x_a, E, bsign);
+        C f_b = disp_eval(x_b, E, bsign);
+        C best = x_a;
+        double best_r = std::abs(f_a);
+        if (std::abs(f_b) < best_r) { best = x_b; best_r = std::abs(f_b); }
+
+        for (int64_t it = 0; it < max_iter; ++it) {
+          C denom = f_b - f_a;
+          if (std::abs(denom) < 1e-20) break;
+          C x_c = x_b - f_b * (x_b - x_a) / denom;
+          if (!std::isfinite(x_c.real()) || !std::isfinite(x_c.imag())) break;
+          if (x_c.real() <= 0.0) break;
+          C f_c = disp_eval(x_c, E, bsign);
+          if (std::abs(f_c) < best_r) { best = x_c; best_r = std::abs(f_c); }
+          if (std::abs(x_c - x_b) <= 1e-12 * (1.0 + std::abs(x_c))) return best;
+          x_a = x_b; f_a = f_b; x_b = x_c; f_b = f_c;
+          if (std::abs(f_b) <= 1e-10 * sc) return best;
+        }
+
+        // Polish with Newton (8 iterations)
+        C xp = best;
+        double bp = best_r;
+        for (int i = 0; i < 8; ++i) {
+          double sloc = std::max(std::abs(xp), 1.0);
+          C h(1e-8*sloc, 1e-8*sloc);
+          C fc = disp_eval(xp, E, bsign);
+          C fp = disp_eval(xp+h, E, bsign);
+          C fm = disp_eval(xp-h, E, bsign);
+          C dfdx = (fp-fm)/(C(2.0)*h);
+          if (std::abs(dfdx) < 1e-20) break;
+          C xn = xp - fc/dfdx;
+          if (!std::isfinite(xn.real()) || !std::isfinite(xn.imag())) break;
+          if (xn.real() <= 0.0 || std::sqrt(xn.real()) < real_k_min) break;
+          C fn = disp_eval(xn, E, bsign);
+          if (std::abs(fn) < bp) { xp = xn; bp = std::abs(fn); }
+          else xp = xn;  // continue Newton anyway
+        }
+        if (bp < best_r) best = xp;
+        return best;
+      };
+
+      C x_def = do_refine(default_sign);
+      C x_alt = do_refine(-default_sign);
+
+      // Candidate scoring: 4 candidates (default±conj, alt±conj)
+      struct Cand { double sign; C x; C k; };
+      auto make_k = [](C x) -> C {
+        C k = std::sqrt(x); return k.real() < 0 ? -k : k;
+      };
+      Cand cands[4] = {
+        {default_sign, x_def, make_k(x_def)},
+        {default_sign, std::conj(x_def), make_k(std::conj(x_def))},
+        {-default_sign, x_alt, make_k(x_alt)},
+        {-default_sign, std::conj(x_alt), make_k(std::conj(x_alt))},
+      };
+
+      auto score = [&](const Cand &c) -> std::tuple<int,double,double> {
+        double r = std::abs(disp_eval(c.x, E, c.sign));
+        int pos_imag = c.k.imag() > 1e-12 ? 1 : 0;
+        return {pos_imag, r, std::abs(c.k - k_init)};
+      };
+
+      int best_idx = 0;
+      auto best_score = score(cands[0]);
+      for (int i = 1; i < 4; ++i) {
+        auto s = score(cands[i]);
+        if (s < best_score) { best_score = s; best_idx = i; }
+      }
+
+      C k_best = cands[best_idx].k;
+      C x_best = cands[best_idx].x;
+      double sign_best = cands[best_idx].sign;
+
+      // Guard: near real axis → keep perturbative
+      if (std::abs(k_best.imag()) < std::max(1e-8, 1e-2*std::abs(k_init.imag()))) {
+        x_best = x0; k_best = k_init;
+      }
+      if (k_best.real() <= 0.0 || k_best.real() < real_k_min) {
+        x_best = x0; k_best = k_init;
+      }
+      if (k_best.imag() > 0.0 && std::abs(k_best.imag()) < 1e-6) {
+        x_best = x0; k_best = k_init;
+      }
+
+      xo[m] = x_best;
+      so[m] = sign_best;
+    }
+  });
+
+  return std::make_tuple(x_out, signs_out);
+}
+
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1355,4 +1610,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("dispersion_complex_batch", &dispersion_complex_batch_cpp);
   m.def("dispersion_complex_scalar", &dispersion_complex_scalar_cpp);
   m.def("tridiag_inverse_iteration_batch", &tridiag_inverse_iteration_batch_cpp);
+  m.def("fused_assembly_inverse_iteration", &fused_assembly_inverse_iteration_cpp);
+  m.def("refine_roots", &refine_roots_cpp);
 }

@@ -906,6 +906,10 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
                 grad_f_num = (grad_f_cur / (2.0 * h * rho)).reshape(1)
                 grad_g_val = grad_g_cur.reshape(1)
 
+                # The complex dispersion function is holomorphic in h2k2 and B1.
+                # The adjoint for a holomorphic function does NOT conjugate the
+                # forward coefficients (Wirtinger ∂f/∂z̄ = 0 for holomorphic f).
+                # Using complex_case=False gives the correct ordinary derivative.
                 grad_B1_layer, grad_h2k2_layer, grad_p1i_layer, grad_p2i_layer = (
                     _run_recurrence_bwd(
                         grad_f_num,
@@ -917,7 +921,7 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
                         loc_end - 1,
                         p1_init_layers[layer_idx],
                         p2_init_layers[layer_idx],
-                        True,
+                        False,
                     )
                 )
 
