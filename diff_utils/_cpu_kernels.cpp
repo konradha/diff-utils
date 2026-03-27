@@ -1873,7 +1873,7 @@ torch::Tensor elastic_solve1_cpp(
 // Fused KRAKENC solve: refine roots + build tridiag + inverse iteration.
 // Eliminates Python round-trips between refine_roots and extract_modes.
 // ---------------------------------------------------------------------------
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 krakenc_fused_cpp(
     torch::Tensor x_init_t,     // [M] complex128 — real KRAKEN eigenvalues
     torch::Tensor k_init_t,     // [M] complex128 — real KRAKEN wavenumbers
@@ -1965,80 +1965,136 @@ krakenc_fused_cpp(
     refine_list = std::move(refine_list2);
   }
 
-  // Refine only the modes that need it (per-mode secant — can't batch this)
-  for (int64_t mi = 0; mi < (int64_t)refine_list.size(); ++mi) {
-    int64_t m = refine_list[mi];
-    C x0 = x0_all[m];
-    C k_init = ki[m];
-    double default_sign = signs[m];
+  // Batched secant refinement: advance all active modes together per iteration.
+  // Two parallel tracks: default_sign and alt_sign (-default_sign).
+  if (!refine_list.empty()) {
+    int64_t K = (int64_t)refine_list.size();
 
-    auto do_refine = [&](double bsign) -> C {
-      C x_a = x0;
-      double sc = std::max(std::abs(x_a), 1.0);
-      C x_b = x_a * C(1.0+1e-8, 1e-8) + C(0.0, 1e-10*sc);
-      C f_a = disp_eval(x_a, E, bsign);
-      C f_b = disp_eval(x_b, E, bsign);
-      C best = x_a;
-      double best_r = std::abs(f_a);
-      if (std::abs(f_b) < best_r) { best = x_b; best_r = std::abs(f_b); }
-      for (int64_t it = 0; it < max_iter; ++it) {
-        C denom = f_b - f_a;
-        if (std::abs(denom) < 1e-20) break;
-        C x_c = x_b - f_b * (x_b - x_a) / denom;
-        if (!std::isfinite(x_c.real()) || !std::isfinite(x_c.imag())) break;
-        if (x_c.real() <= 0.0) break;
-        C f_c = disp_eval(x_c, E, bsign);
-        if (std::abs(f_c) < best_r) { best = x_c; best_r = std::abs(f_c); }
-        if (std::abs(x_c - x_b) <= 1e-12*(1.0+std::abs(x_c))) return best;
-        x_a = x_b; f_a = f_b; x_b = x_c; f_b = f_c;
+    // Per-mode secant state for both branch signs
+    struct SecState {
+      C x_a, x_b, f_a, f_b, best;
+      double best_r, bsign;
+      bool done;
+    };
+    std::vector<SecState> tracks(2 * K);  // [0..K) = default, [K..2K) = alt
+
+    // Initialize: x_a = x0, x_b = perturbed x0
+    std::vector<C> eval_x(2 * K);
+    std::vector<double> eval_s(2 * K);
+    for (int64_t i = 0; i < K; ++i) {
+      int64_t m = refine_list[i];
+      C x0 = x0_all[m];
+      double sc = std::max(std::abs(x0), 1.0);
+      C x_b = x0 * C(1.0+1e-8, 1e-8) + C(0.0, 1e-10*sc);
+      double ds = signs[m];  // default_sign from branch check
+
+      tracks[i]     = {x0, x_b, C(0), C(0), x0, 1e30, ds, false};
+      tracks[K + i] = {x0, x_b, C(0), C(0), x0, 1e30, -ds, false};
+      eval_x[i]     = x0;     eval_s[i]     = ds;
+      eval_x[K + i] = x0;     eval_s[K + i] = -ds;
+    }
+
+    // Initial f_a evaluation (batched, one sweep for all 2K modes)
+    std::vector<C> f_out(2 * K);
+    disp_eval_batch(eval_x.data(), eval_s.data(), 2 * K, E, f_out.data());
+    for (int64_t i = 0; i < 2 * K; ++i) {
+      tracks[i].f_a = f_out[i];
+      tracks[i].best_r = std::abs(f_out[i]);
+    }
+
+    // Initial f_b evaluation
+    for (int64_t i = 0; i < 2 * K; ++i) eval_x[i] = tracks[i].x_b;
+    disp_eval_batch(eval_x.data(), eval_s.data(), 2 * K, E, f_out.data());
+    for (int64_t i = 0; i < 2 * K; ++i) {
+      tracks[i].f_b = f_out[i];
+      if (std::abs(f_out[i]) < tracks[i].best_r) {
+        tracks[i].best = tracks[i].x_b;
+        tracks[i].best_r = std::abs(f_out[i]);
       }
-      return best;
-    };
+    }
 
-    C x_def = do_refine(default_sign);
-    C x_alt = do_refine(-default_sign);
+    // Secant iterations (batched)
+    for (int64_t it = 0; it < max_iter; ++it) {
+      // Compute next x_c for all active tracks
+      int64_t n_active = 0;
+      std::vector<int64_t> active_idx;
+      active_idx.reserve(2 * K);
+      for (int64_t i = 0; i < 2 * K; ++i) {
+        if (tracks[i].done) continue;
+        C denom = tracks[i].f_b - tracks[i].f_a;
+        if (std::abs(denom) < 1e-20) { tracks[i].done = true; continue; }
+        C x_c = tracks[i].x_b - tracks[i].f_b * (tracks[i].x_b - tracks[i].x_a) / denom;
+        if (!std::isfinite(x_c.real()) || !std::isfinite(x_c.imag()) || x_c.real() <= 0.0) {
+          tracks[i].done = true; continue;
+        }
+        eval_x[n_active] = x_c;
+        eval_s[n_active] = tracks[i].bsign;
+        active_idx.push_back(i);
+        ++n_active;
+      }
+      if (n_active == 0) break;
 
+      // Batched evaluation
+      disp_eval_batch(eval_x.data(), eval_s.data(), n_active, E, f_out.data());
+
+      for (int64_t j = 0; j < n_active; ++j) {
+        int64_t i = active_idx[j];
+        C x_c = eval_x[j];
+        C f_c = f_out[j];
+        if (std::abs(f_c) < tracks[i].best_r) { tracks[i].best = x_c; tracks[i].best_r = std::abs(f_c); }
+        if (std::abs(x_c - tracks[i].x_b) <= 1e-12 * (1.0 + std::abs(x_c))) tracks[i].done = true;
+        tracks[i].x_a = tracks[i].x_b; tracks[i].f_a = tracks[i].f_b;
+        tracks[i].x_b = x_c; tracks[i].f_b = f_c;
+      }
+    }
+
+    // Score 4 candidates per mode (batched)
     auto make_k = [](C x) -> C { C k = std::sqrt(x); return k.real() < 0 ? -k : k; };
-    struct Cand { double sign; C x; C k; };
-    Cand cands[4] = {
-      {default_sign,  x_def, make_k(x_def)},
-      {default_sign,  std::conj(x_def), make_k(std::conj(x_def))},
-      {-default_sign, x_alt, make_k(x_alt)},
-      {-default_sign, std::conj(x_alt), make_k(std::conj(x_alt))},
-    };
-
-    // Score candidates with batched dispersion
-    C cand_x[4] = {cands[0].x, cands[1].x, cands[2].x, cands[3].x};
-    double cand_s[4] = {cands[0].sign, cands[1].sign, cands[2].sign, cands[3].sign};
-    C cand_d[4];
-    disp_eval_batch(cand_x, cand_s, 4, E, cand_d);
-
-    int best_idx = 0;
-    auto mk_score = [&](int i) -> std::tuple<int,double,double> {
-      int pos_imag = cands[i].k.imag() > 1e-12 ? 1 : 0;
-      return {pos_imag, std::abs(cand_d[i]), std::abs(cands[i].k - k_init)};
-    };
-    auto best_score = mk_score(0);
-    for (int i = 1; i < 4; ++i) {
-      auto s = mk_score(i);
-      if (s < best_score) { best_score = s; best_idx = i; }
+    std::vector<C> score_x(4 * K);
+    std::vector<double> score_s(4 * K);
+    for (int64_t i = 0; i < K; ++i) {
+      C x_def = tracks[i].best, x_alt = tracks[K + i].best;
+      double ds = tracks[i].bsign;
+      score_x[4*i+0] = x_def;             score_s[4*i+0] = ds;
+      score_x[4*i+1] = std::conj(x_def);  score_s[4*i+1] = ds;
+      score_x[4*i+2] = x_alt;             score_s[4*i+2] = -ds;
+      score_x[4*i+3] = std::conj(x_alt);  score_s[4*i+3] = -ds;
     }
+    std::vector<C> score_d(4 * K);
+    disp_eval_batch(score_x.data(), score_s.data(), 4 * K, E, score_d.data());
 
-    C x_best = cands[best_idx].x;
-    C k_best = cands[best_idx].k;
-    double sign_best = cands[best_idx].sign;
+    for (int64_t i = 0; i < K; ++i) {
+      int64_t m = refine_list[i];
+      C k_init = ki[m];
 
-    if (std::abs(k_best.imag()) < std::max(1e-8, 1e-2*std::abs(k_init.imag()))) {
-      x_best = x0; k_best = k_init;
+      int best_idx = 0;
+      auto mk = [&](int j) -> std::tuple<int,double,double> {
+        C k = make_k(score_x[4*i+j]);
+        return {k.imag() > 1e-12 ? 1 : 0, std::abs(score_d[4*i+j]), std::abs(k - k_init)};
+      };
+      auto best_sc = mk(0);
+      for (int j = 1; j < 4; ++j) {
+        auto s = mk(j);
+        if (s < best_sc) { best_sc = s; best_idx = j; }
+      }
+
+      C x_best = score_x[4*i + best_idx];
+      C k_best = make_k(x_best);
+      double sign_best = score_s[4*i + best_idx];
+      C x0 = x0_all[m];
+
+      if (std::abs(k_best.imag()) < std::max(1e-8, 1e-2*std::abs(k_init.imag()))) {
+        x_best = x0; k_best = k_init;
+      }
+      if (k_best.real() <= 0.0 || k_best.real() < real_k_min) {
+        x_best = x0; k_best = k_init;
+      }
+      if (k_best.imag() > 0.0 && std::abs(k_best.imag()) < 1e-6) {
+        x_best = x0; k_best = k_init;
+      }
+      x_refined[m] = x_best;
+      signs[m] = sign_best;
     }
-    if (k_best.real() <= 0.0 || k_best.real() < real_k_min) {
-      x_best = x0; k_best = k_init;
-    }
-    if (k_best.imag() > 0.0 && std::abs(k_best.imag()) < 1e-6) {
-      x_best = x0; k_best = k_init;
-    }
-    x_refined[m] = x_best;
-    signs[m] = sign_best;
   }
 
   // --- Step 3: Build base_d, h2_factor, e from workspace ---
@@ -2089,14 +2145,23 @@ krakenc_fused_cpp(
     }
   }
 
-  // --- Step 4: Compute BC ratios + inverse iteration per mode ---
+  // --- Step 4: Compute BC ratios + inverse iteration (only for refined modes) ---
   auto phi = torch::full({M, N_total1}, C(1e-10), torch::dtype(torch::kComplexDouble));
   C *pp = reinterpret_cast<C*>(phi.data_ptr());
 
   auto x_out = torch::empty({M}, torch::dtype(torch::kComplexDouble));
   auto signs_out = torch::empty({M}, torch::dtype(torch::kDouble));
+  // needs_phi[m] = 1 if mode m needs inverse iteration, 0 if perturbative (caller fills phi)
+  auto needs_phi_t = torch::zeros({M}, torch::dtype(torch::kBool));
+  bool *needs_phi = needs_phi_t.data_ptr<bool>();
   C *xo = reinterpret_cast<C*>(x_out.data_ptr());
   double *so = signs_out.data_ptr<double>();
+
+  // Mark which modes were refined (need new phi) vs perturbative (reuse existing)
+  for (int64_t m = 0; m < M; ++m) {
+    double k_imag_ratio = std::abs(ki[m].imag()) / std::max(1e-30, std::abs(ki[m].real()));
+    needs_phi[m] = (k_imag_ratio >= 1e-10);
+  }
 
   std::vector<C> dw(N_total1);
 
@@ -2104,6 +2169,8 @@ krakenc_fused_cpp(
     C x_m = x_refined[m];
     xo[m] = x_m;
     so[m] = signs[m];
+
+    if (!needs_phi[m]) continue;  // skip inverse iteration for perturbative modes
 
     // BC impedance for this mode
     C bsign(signs[m], 0.0);
@@ -2154,7 +2221,7 @@ krakenc_fused_cpp(
     if (nrm > 0.0) { C inv(1.0/nrm); for (int64_t i = 0; i < N_total1; ++i) pm[i] *= inv; }
   }
 
-  return std::make_tuple(x_out, signs_out, phi);
+  return std::make_tuple(x_out, signs_out, phi, needs_phi_t);
 }
 
 } // namespace
