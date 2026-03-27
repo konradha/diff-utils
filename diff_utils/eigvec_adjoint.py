@@ -673,59 +673,53 @@ class TridiagEigvecVaryingBatchAdjointFn(torch.autograd.Function):
         M, N = phi_batch.shape
         reg = max(ctx.eps * ctx.eps, 1e-14)
 
-        grad_d_batch = torch.zeros_like(d_batch)
-        grad_e_batch = torch.zeros_like(e_batch)
+        # Batched: compute all M projections and tridiag solves together
+        if phi_batch.is_complex():
+            phi_sq_norm = (phi_batch.conj() * phi_batch).sum(dim=1).real  # [M]
+        else:
+            phi_sq_norm = (phi_batch * phi_batch).sum(dim=1)
+        phi_hat = phi_batch / phi_sq_norm.sqrt().clamp(min=1e-30).unsqueeze(1)  # [M, N]
 
-        for m in range(M):
-            phi_m = phi_batch[m]
-            d_m = d_batch[m]
-            e_m = e_batch[m]
-            g_m = grad_phi_batch[m]
-
-            # Unit-normalize phi for the projection and solve to avoid
-            # ill-conditioning from the near-singular (T-sigma) system.
-            # Porter-normalized phi has ||phi||^2 != 1, which leaves a
-            # residual null-space component that the near-singular solve
-            # amplifies catastrophically. We solve in the unit-norm basis
-            # then map the gradient back to the Porter-normalized convention.
-            if phi_m.is_complex():
-                phi_sq_norm = (phi_m.conj() * phi_m).sum().real
-            else:
-                phi_sq_norm = (phi_m * phi_m).sum()
-            phi_hat = phi_m / phi_sq_norm.sqrt().clamp(min=1e-30)
-
-            if sigmas_saved is not None:
-                sigma = sigmas_saved[m]
-            else:
-                Tphi = d_m * phi_hat
-                Tphi[:-1] += phi_hat[1:] * e_m
-                Tphi[1:] += phi_hat[:-1] * e_m
-                if phi_hat.is_complex():
-                    sigma = (phi_hat.conj() * Tphi).sum().real
-                else:
-                    sigma = (phi_hat * Tphi).sum()
-
-            # Project gradient orthogonal to unit-norm phi
+        # Eigenvalue estimates
+        if sigmas_saved is not None:
+            sigmas = sigmas_saved  # [M]
+        else:
+            Tphi = d_batch * phi_hat
+            Tphi[:, :-1] += phi_hat[:, 1:] * e_batch
+            Tphi[:, 1:] += phi_hat[:, :-1] * e_batch
             if phi_hat.is_complex():
-                coeff = (phi_hat.conj() * g_m).sum()
+                sigmas = (phi_hat.conj() * Tphi).sum(dim=1).real
             else:
-                coeff = (phi_hat * g_m).sum()
-            g_orth = g_m - coeff * phi_hat
+                sigmas = (phi_hat * Tphi).sum(dim=1)
 
-            shifted_d = d_m - sigma.to(d_m.dtype) + reg
-            lam = solve_tridiag(e_m, shifted_d, e_m, g_orth)
-            if phi_hat.is_complex():
-                coeff2 = (phi_hat.conj() * lam).sum()
-            else:
-                coeff2 = (phi_hat * lam).sum()
-            lam = lam - coeff2 * phi_hat
+        # Project gradients orthogonal to phi_hat
+        if phi_hat.is_complex():
+            coeffs = (phi_hat.conj() * grad_phi_batch).sum(dim=1, keepdim=True)
+        else:
+            coeffs = (phi_hat * grad_phi_batch).sum(dim=1, keepdim=True)
+        g_orth = grad_phi_batch - coeffs * phi_hat  # [M, N]
 
-            # Gradient uses original phi_m (Porter normalization).
-            # lam was solved with unit-norm projection for stability,
-            # but grad_d = -lam * phi_m is the correct chain rule for
-            # the eigenvector perturbation of the non-unit eigenvector.
-            grad_d_batch[m] = -lam * phi_m
-            grad_e_batch[m] = -lam[:-1] * phi_m[1:] - lam[1:] * phi_m[:-1]
+        # Batched tridiag solve: (T - sigma*I + reg) lam = g_orth
+        shifted_d = d_batch - sigmas.to(d_batch.dtype).unsqueeze(1) + reg  # [M, N]
+        if e_batch.dim() == 2 and M > 1 and torch.allclose(e_batch[0], e_batch[1]):
+            # Shared off-diagonal — use batched C++ solve
+            lam = solve_tridiag_batch(e_batch[0], shifted_d, e_batch[0], g_orth)
+        else:
+            # Per-mode off-diagonals — solve individually
+            lam = torch.zeros_like(g_orth)
+            for m in range(M):
+                e_m = e_batch[m] if e_batch.dim() == 2 else e_batch
+                lam[m] = solve_tridiag(e_m, shifted_d[m], e_m, g_orth[m])
+
+        # Re-project to remove residual null-space component
+        if phi_hat.is_complex():
+            coeffs2 = (phi_hat.conj() * lam).sum(dim=1, keepdim=True)
+        else:
+            coeffs2 = (phi_hat * lam).sum(dim=1, keepdim=True)
+        lam = lam - coeffs2 * phi_hat
+
+        grad_d_batch = -lam * phi_batch  # [M, N]
+        grad_e_batch = -lam[:, :-1] * phi_batch[:, 1:] - lam[:, 1:] * phi_batch[:, :-1]  # [M, N-1]
 
         return None, grad_d_batch, grad_e_batch, None, None, None
 

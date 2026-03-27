@@ -51,7 +51,7 @@ def _lorentz_inv(z: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 def _ift_forward_sweep(x_m, B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n, f_bot, g_bot):
-    """Forward recurrence through acoustic layers. Returns per-layer cache for backward."""
+    """Forward recurrence through acoustic layers (single mode). Returns per-layer cache."""
     f_in = [None] * n_layers
     g_in = [None] * n_layers
     h2k2_l = [None] * n_layers
@@ -88,21 +88,56 @@ def _ift_forward_sweep(x_m, B1_c, n_layers, layer_h, layer_rho, layer_loc, layer
     return f_cur, g_cur, f_in, g_in, h2k2_l, p1i_l, p2i_l, ph_l
 
 
+def _ift_forward_sweep_batch(x_batch, B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n, f_bot, g_bot):
+    """Batched forward recurrence: M modes through acoustic layers in one pass per layer."""
+    M = x_batch.shape[0]
+    h2k2_l = [None] * n_layers
+    p1i_l = [None] * n_layers
+    p2i_l = [None] * n_layers
+    ph_l = [None] * n_layers
+    g_in = [None] * n_layers
+
+    f_cur, g_cur = f_bot, g_bot  # [M] tensors
+
+    for rev_idx in range(n_layers):
+        li = n_layers - 1 - rev_idx
+        h = layer_h[li]
+        rho = layer_rho[li]
+        loc = int(layer_loc[li].item())
+        n_pts = int(layer_n[li].item())
+        loc_end = loc + n_pts - 1
+
+        g_in[li] = g_cur
+
+        h2k2 = h * h * x_batch  # [M]
+        p1_init = -2.0 * g_cur  # [M]
+        p2_init = (B1_c[loc_end] - h2k2) * g_cur - 2.0 * h * f_cur * rho  # [M]
+        f_num, g_val, p_history = AcousticRecurrenceFn.apply(
+            B1_c, h2k2, loc, loc_end - 1, p1_init, p2_init,
+        )
+        h2k2_l[li] = h2k2
+        p1i_l[li] = p1_init
+        p2i_l[li] = p2_init
+        ph_l[li] = p_history  # [M, sweep_len]
+
+        f_cur = f_num / (2.0 * h * rho)  # [M]
+        g_cur = g_val  # [M]
+
+    return f_cur, g_cur, g_in, h2k2_l, p1i_l, p2i_l, ph_l
+
+
 def _ift_backward_sweep(
     B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n,
     g_in, h2k2_l, p1i_l, p2i_l, ph_l, is_complex,
 ):
-    """Backward recurrence through acoustic layers.
+    """Backward recurrence through acoustic layers (single mode).
 
     Returns (grad_f_bot, grad_g_bot, dDelta_dx, grad_B1_delta).
-    Caller handles BC-specific derivatives outside.
     """
     device = B1_c.device
     dtype = torch.complex128 if is_complex else torch.float64
     grad_f_cur = torch.zeros((), dtype=dtype, device=device)
-    grad_g_cur = -torch.ones((), dtype=dtype, device=device) if is_complex else (
-        -torch.ones((), dtype=dtype, device=device)
-    )
+    grad_g_cur = -torch.ones((), dtype=dtype, device=device)
     dDelta_dx = torch.zeros((), dtype=dtype, device=device)
     grad_B1_delta = torch.zeros_like(B1_c)
 
@@ -134,6 +169,54 @@ def _ift_backward_sweep(
         grad_g_cur = (
             -2.0 * grad_p1i_layer[0]
             + (B1_c[loc_end] - h2k2_l[li][0]) * grad_p2i_layer[0]
+        )
+
+    return grad_f_cur, grad_g_cur, dDelta_dx, grad_B1_delta
+
+
+def _ift_backward_sweep_batch(
+    B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n,
+    g_in, h2k2_l, p1i_l, p2i_l, ph_l, M,
+):
+    """Batched backward recurrence: M modes through acoustic layers.
+
+    Returns (grad_f_bot[M], grad_g_bot[M], dDelta_dx[M], grad_B1_delta).
+    """
+    device = B1_c.device
+    dtype = torch.complex128
+    grad_f_cur = torch.zeros(M, dtype=dtype, device=device)
+    grad_g_cur = -torch.ones(M, dtype=dtype, device=device)
+    dDelta_dx = torch.zeros(M, dtype=dtype, device=device)
+    grad_B1_delta = torch.zeros_like(B1_c)
+
+    for li in range(n_layers):
+        h = layer_h[li]
+        rho = layer_rho[li]
+        loc = int(layer_loc[li].item())
+        n_pts = int(layer_n[li].item())
+        loc_end = loc + n_pts - 1
+
+        grad_f_num = grad_f_cur / (2.0 * h * rho)  # [M]
+        grad_g_val = grad_g_cur  # [M]
+
+        grad_B1_layer, grad_h2k2_layer, grad_p1i_layer, grad_p2i_layer = (
+            _run_recurrence_bwd(
+                grad_f_num, grad_g_val, B1_c,
+                h2k2_l[li], ph_l[li], loc, loc_end - 1,
+                p1i_l[li], p2i_l[li], False,
+            )
+        )
+
+        grad_B1_delta += grad_B1_layer
+        grad_B1_delta[loc_end] += (grad_p2i_layer * g_in[li]).sum()
+
+        grad_h2k2_total = grad_h2k2_layer - grad_p2i_layer * g_in[li]  # [M]
+        dDelta_dx = dDelta_dx + grad_h2k2_total * (h * h)
+
+        grad_f_cur = -2.0 * h * rho * grad_p2i_layer  # [M]
+        grad_g_cur = (
+            -2.0 * grad_p1i_layer
+            + (B1_c[loc_end] - h2k2_l[li]) * grad_p2i_layer
         )
 
     return grad_f_cur, grad_g_cur, dDelta_dx, grad_B1_delta
@@ -920,29 +1003,39 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
             torch.tensor(dc_imag_dc, dtype=c_bot.dtype, device=c_bot.device),
         )
 
+        x_c = x_converged.detach().to(torch.complex128)  # [M]
+        bs_c = branch_signs.detach().to(torch.complex128)  # [M]
+        gamma2 = x_c - omega2 / (cp_c * cp_c)  # [M]
+        f_sqrt = torch.sqrt(gamma2)  # [M]
+        f_bot_all = bs_c * f_sqrt  # [M]
+        g_bot_val = rho_bot.detach().to(torch.complex128)
+        dfdx_bot = bs_c * 0.5 / f_sqrt  # [M]
+        dfdc_bot = bs_c * omega2 / (cp_c**3 * f_sqrt) * dcp_dc  # [M]
+
+        # Batched forward sweep — single C++ call per layer for all M modes
+        _, _, g_in, h2k2_l, p1i_l, p2i_l, ph_l = _ift_forward_sweep_batch(
+            x_c, B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n,
+            f_bot_all, g_bot_val.expand(M),
+        )
+
+        # Per-mode backward (B1 gradient needs per-mode ift_scale)
         for m in range(M):
-            x_m = x_converged[m].detach().to(torch.complex128)
-            branch_sign = branch_signs[m].detach().to(torch.complex128)
-            gamma2 = x_m - omega2 / (cp_c * cp_c)
-            f_sqrt = torch.sqrt(gamma2)
-            f_bot = branch_sign * f_sqrt
-            g_bot = rho_bot.detach().to(torch.complex128)
-            dfdx_bot = branch_sign * 0.5 / f_sqrt
-            dfdc_bot = branch_sign * omega2 / (cp_c**3 * f_sqrt) * dcp_dc
+            g_in_m = [g[m] for g in g_in]
+            h2k2_m = [h[m:m+1] for h in h2k2_l]
+            p1i_m = [p[m:m+1] for p in p1i_l]
+            p2i_m = [p[m:m+1] for p in p2i_l]
+            ph_m = [p[m:m+1] for p in ph_l]
 
-            _, _, f_in, g_in, h2k2_l, p1i_l, p2i_l, ph_l = _ift_forward_sweep(
-                x_m, B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n, f_bot, g_bot,
-            )
-            grad_f_bot, grad_g_bot, dDelta_dx, grad_B1_delta = _ift_backward_sweep(
+            grad_f_bot_m, grad_g_bot_m, dDelta_dx_m, grad_B1_delta = _ift_backward_sweep(
                 B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n,
-                g_in, h2k2_l, p1i_l, p2i_l, ph_l, True,
+                g_in_m, h2k2_m, p1i_m, p2i_m, ph_m, True,
             )
 
-            dDelta_dx = dDelta_dx + grad_f_bot * dfdx_bot
-            dDelta_dc = grad_f_bot * dfdc_bot
-            dDelta_drho = grad_g_bot
+            dDelta_dx_m = dDelta_dx_m + grad_f_bot_m * dfdx_bot[m]
+            dDelta_dc = grad_f_bot_m * dfdc_bot[m]
+            dDelta_drho = grad_g_bot_m
 
-            ift_scale = -grad_x[m].conj() * _lorentz_inv(dDelta_dx, eps)
+            ift_scale = -grad_x[m].conj() * _lorentz_inv(dDelta_dx_m, eps)
             grad_B1_total = grad_B1_total + (ift_scale * grad_B1_delta).real.to(B1.dtype)
             grad_c_bot = grad_c_bot + (ift_scale * dDelta_dc).real.to(c_bot.dtype)
             grad_rho_bot = grad_rho_bot + (ift_scale * dDelta_drho).real.to(rho_bot.dtype)
