@@ -14,19 +14,10 @@ namespace {
 
 template <typename scalar_t>
 inline scalar_t maybe_conj(scalar_t v, bool complex_case) {
-  return v;
-}
-
-template <>
-inline c10::complex<float> maybe_conj(c10::complex<float> v,
-                                      bool complex_case) {
-  return complex_case ? std::conj(v) : v;
-}
-
-template <>
-inline c10::complex<double> maybe_conj(c10::complex<double> v,
-                                       bool complex_case) {
-  return complex_case ? std::conj(v) : v;
+  if constexpr (c10::is_complex<scalar_t>::value)
+    return complex_case ? std::conj(v) : v;
+  else
+    return v;
 }
 
 template <typename scalar_t>
@@ -433,8 +424,7 @@ acoustic_recurrence_fwd(torch::Tensor B1, torch::Tensor h2k2, int64_t loc_start,
         scalar_t *RESTRICT gv = g_val.data_ptr<scalar_t>();
         scalar_t *RESTRICT ph = p_history.data_ptr<scalar_t>();
 
-        at::parallel_for(0, M, 1, [&](int64_t m_begin, int64_t m_end) {
-          for (int64_t m = m_begin; m < m_end; ++m) {
+        for (int64_t m = 0; m < M; ++m) {
             scalar_t p0 = p1i[m];
             scalar_t p1 = p1i[m];
             scalar_t p2 = p2i[m];
@@ -449,8 +439,7 @@ acoustic_recurrence_fwd(torch::Tensor B1, torch::Tensor h2k2, int64_t loc_start,
             }
             fn[m] = -(p2 - p0);
             gv[m] = -p1;
-          }
-        });
+        }
       });
 
   return std::make_tuple(f_num, g_val, p_history);
@@ -659,8 +648,7 @@ torch::Tensor solve_tridiag_batch(torch::Tensor dl, torch::Tensor d_batch,
         const scalar_t *RESTRICT dlp = dl.data_ptr<scalar_t>();
         const scalar_t *RESTRICT dup = du.data_ptr<scalar_t>();
 
-        at::parallel_for(0, M, 1, [&](int64_t m0, int64_t m1) {
-          for (int64_t m = m0; m < m1; ++m) {
+        for (int64_t m = 0; m < M; ++m) {
             scalar_t *RESTRICT dm = dw + m * N;
             scalar_t *RESTRICT xm = xp + m * N;
             for (int64_t i = 1; i < N; ++i) {
@@ -672,8 +660,7 @@ torch::Tensor solve_tridiag_batch(torch::Tensor dl, torch::Tensor d_batch,
             for (int64_t i = N - 2; i >= 0; --i) {
               xm[i] = (xm[i] - dup[i] * xm[i + 1]) / dm[i];
             }
-          }
-        });
+        }
       });
 
   return x;
@@ -726,14 +713,14 @@ static void bc_impedance(double x, double omega2, const AcousticBC &bc,
                          int64_t &mc) {
   iPower = 0;
   mc = 0;
-  if (bc.type == 0 || bc.rho == 0.0) {
-    f = 1.0;
-    g = 0.0;
-    return;
-  }
   if (bc.type == 1 || bc.rho >= 1e10) {
     f = 0.0;
     g = 1.0;
+    return;
+  }
+  if (bc.type == 0 || bc.rho == 0.0) {
+    f = 1.0;
+    g = 0.0;
     return;
   }
   if (bc.cs > 0.0) {
@@ -1107,30 +1094,23 @@ torch::Tensor tridiag_inverse_iteration_batch_cpp(
         const scalar_t *RESTRICT ep = e.data_ptr<scalar_t>();
         scalar_t *RESTRICT pp = phi.data_ptr<scalar_t>();
 
-        // Each thread gets its own local dw buffer (size N, fits in L2)
-        at::parallel_for(0, M, 1, [&](int64_t m0, int64_t m1) {
-          std::vector<scalar_t> dw_local(N);
-          for (int64_t m = m0; m < m1; ++m) {
+        // Single pre-allocated work buffer, reused across modes
+        std::vector<scalar_t> dw_local(N);
+        for (int64_t m = 0; m < M; ++m) {
             const scalar_t *RESTRICT d_m = d_src + m * N;
             scalar_t *RESTRICT pm = pp + m * N;
 
             for (int64_t iter = 0; iter < n_iter; ++iter) {
-              // Copy only this mode's diagonal (N elements, ~1.3MB for 80K complex128)
               std::memcpy(dw_local.data(), d_m, N * sizeof(scalar_t));
-
-              // Forward elimination
               for (int64_t i = 1; i < N; ++i) {
                 scalar_t w = ep[i - 1] / dw_local[i - 1];
                 dw_local[i] -= w * ep[i - 1];
                 pm[i] -= w * pm[i - 1];
               }
-              // Back substitution
               pm[N - 1] /= dw_local[N - 1];
               for (int64_t i = N - 2; i >= 0; --i) {
                 pm[i] = (pm[i] - ep[i] * pm[i + 1]) / dw_local[i];
               }
-
-              // Normalize by max abs
               double max_abs = 0.0;
               for (int64_t i = 0; i < N; ++i) {
                 double a = std::abs(pm[i]);
@@ -1141,8 +1121,6 @@ torch::Tensor tridiag_inverse_iteration_batch_cpp(
                 for (int64_t i = 0; i < N; ++i) pm[i] *= inv;
               }
             }
-
-            // Final L2 normalization
             double sq_sum = 0.0;
             for (int64_t i = 0; i < N; ++i) {
               double a = std::abs(pm[i]);
@@ -1153,8 +1131,7 @@ torch::Tensor tridiag_inverse_iteration_batch_cpp(
               scalar_t inv_norm = scalar_t(1.0 / norm);
               for (int64_t i = 0; i < N; ++i) pm[i] *= inv_norm;
             }
-          }
-        });
+        }
       });
 
   return phi;
@@ -1194,9 +1171,9 @@ torch::Tensor fused_assembly_inverse_iteration_cpp(
   const bool *RESTRICT bv = bc_bot_vacuum.data_ptr<bool>();
   C *RESTRICT pp = reinterpret_cast<C*>(phi.data_ptr());
 
-  at::parallel_for(0, M, 1, [&](int64_t m0, int64_t m1) {
+  {
     std::vector<C> dw(N);
-    for (int64_t m = m0; m < m1; ++m) {
+    for (int64_t m = 0; m < M; ++m) {
       C x_m = xp[m];
       C *RESTRICT pm = pp + m * N;
 
@@ -1241,7 +1218,7 @@ torch::Tensor fused_assembly_inverse_iteration_cpp(
       double nrm = std::sqrt(sq);
       if (nrm > 0.0) { C inv(1.0/nrm); for (int64_t i = 0; i < N; ++i) pm[i] *= inv; }
     }
-  });
+  }
   return phi;
 }
 
@@ -1255,8 +1232,8 @@ static inline void bc_impedance_complex(
     c10::complex<double> &f, c10::complex<double> &g) {
 
   using C = c10::complex<double>;
-  if (bc_type == 0 || rho == 0.0) { f = C(1.0, 0.0); g = C(0.0, 0.0); }
-  else if (bc_type == 1 || rho >= 1e10) { f = C(0.0, 0.0); g = C(1.0, 0.0); }
+  if (bc_type == 1 || rho >= 1e10) { f = C(0.0, 0.0); g = C(1.0, 0.0); }
+  else if (bc_type == 0 || rho == 0.0) { f = C(1.0, 0.0); g = C(0.0, 0.0); }
   else if (cs_r > 0.0) {
     C cp_c(cp_r, c_imag_p), cs_c(cs_r, c_imag_s);
     C gammaS2 = x - omega2 / (cs_c * cs_c);
@@ -1306,8 +1283,7 @@ torch::Tensor dispersion_complex_batch_cpp(
   const double *RESTRICT lr = layer_rho.data_ptr<double>();
   const double *RESTRICT bsigns = branch_signs.data_ptr<double>();
 
-  at::parallel_for(0, M, 1, [&](int64_t m0, int64_t m1) {
-    for (int64_t m = m0; m < m1; ++m) {
+  for (int64_t m = 0; m < M; ++m) {
       C x = xp[m];
       C bsign(bsigns[m], 0.0);
       C f, g;
@@ -1342,8 +1318,7 @@ torch::Tensor dispersion_complex_batch_cpp(
                            top_cs, top_c_imag_s, top_rho,
                            bc_top_type, true, C(1.0), f_top, g_top);
       delta_p[m] = f * g_top - g * f_top;
-    }
-  });
+  }
   return delta_out;
 }
 
@@ -1482,8 +1457,7 @@ std::tuple<torch::Tensor, torch::Tensor> refine_roots_cpp(
 
   // Determine branch signs for all modes (batch: 2 dispersion calls per mode)
   // Then refine each mode independently
-  at::parallel_for(0, M, 1, [&](int64_t m0, int64_t m1) {
-    for (int64_t m = m0; m < m1; ++m) {
+  for (int64_t m = 0; m < M; ++m) {
       C x0 = xi[m];
       C k_init = ki[m];
 
@@ -1583,10 +1557,265 @@ std::tuple<torch::Tensor, torch::Tensor> refine_roots_cpp(
 
       xo[m] = x_best;
       so[m] = sign_best;
-    }
-  });
+  }
 
   return std::make_tuple(x_out, signs_out);
+}
+
+// ---------------------------------------------------------------------------
+// Elastic compound-matrix propagation (5-component Porter formulation).
+// Propagates yV[5] through elastic layers using the standard finite-difference
+// leapfrog scheme with iPower normalization on yV[1].
+// ---------------------------------------------------------------------------
+
+static void elastic_compound_propagate(
+    const double *b1, const double *b2, const double *b3, const double *b4,
+    const double *rho_arr, double x, double yV[5], double h, int64_t n_steps,
+    int64_t loc_start, bool going_up, int64_t &iPower) {
+
+  double two_x = 2.0 * x;
+  double two_h = 2.0 * h;
+  double four_h_x = 4.0 * h * x;
+
+  int64_t j = loc_start + (going_up ? n_steps : 0);
+  double xB3 = x * b3[j] - rho_arr[j];
+
+  // Half-step: z = y - 0.5 * M * y
+  double z[5];
+  z[0] = yV[0] - 0.5 * (b1[j] * yV[3] - b2[j] * yV[4]);
+  z[1] = yV[1] - 0.5 * (-rho_arr[j] * yV[3] - xB3 * yV[4]);
+  z[2] = yV[2] - 0.5 * (two_h * yV[3] + b4[j] * yV[4]);
+  z[3] = yV[3] - 0.5 * (xB3 * yV[0] + b2[j] * yV[1] - two_x * b4[j] * yV[2]);
+  z[4] = yV[4] - 0.5 * (rho_arr[j] * yV[0] - b1[j] * yV[1] - four_h_x * yV[2]);
+
+  for (int64_t step = 0; step < n_steps; ++step) {
+    if (going_up)
+      --j;
+    else
+      ++j;
+
+    // Swap: y_old = y; y = z; z = y_old
+    double tmp[5];
+    for (int i = 0; i < 5; ++i) tmp[i] = yV[i];
+    for (int i = 0; i < 5; ++i) yV[i] = z[i];
+    for (int i = 0; i < 5; ++i) z[i] = tmp[i];
+
+    xB3 = x * b3[j] - rho_arr[j];
+
+    z[0] -= (b1[j] * yV[3] - b2[j] * yV[4]);
+    z[1] -= (-rho_arr[j] * yV[3] - xB3 * yV[4]);
+    z[2] -= (two_h * yV[3] + b4[j] * yV[4]);
+    z[3] -= (xB3 * yV[0] + b2[j] * yV[1] - two_x * b4[j] * yV[2]);
+    z[4] -= (rho_arr[j] * yV[0] - b1[j] * yV[1] - four_h_x * yV[2]);
+
+    // iPower normalization on z[1]
+    if (step < n_steps - 1) {
+      double scale_val = std::abs(z[1]);
+      if (scale_val < FLOOR_V) {
+        for (int i = 0; i < 5; ++i) { z[i] *= ROOF_V; yV[i] *= ROOF_V; }
+        iPower -= IPOWER_R_V;
+      } else if (scale_val > ROOF_V) {
+        for (int i = 0; i < 5; ++i) { z[i] *= FLOOR_V; yV[i] *= FLOOR_V; }
+        iPower += IPOWER_R_V;
+      }
+    }
+  }
+
+  // Output is z (the "newest" value)
+  for (int i = 0; i < 5; ++i) yV[i] = z[i];
+}
+
+// Full elastic dispersion evaluation: BC -> elastic layers -> acoustic recurrence -> match
+static DispResult dispersion_elastic_eval(
+    double x, const double *b1, const double *b2, const double *b3,
+    const double *b4, const double *rho_full, int64_t n_layers,
+    const int64_t *layer_loc, const int64_t *layer_n, const double *layer_h,
+    const double *layer_rho, double omega2, const AcousticBC &bc_bot,
+    const AcousticBC &bc_top, int64_t first_acoustic, int64_t last_acoustic) {
+
+  // Bottom BC
+  double f, g;
+  int64_t iPower = 0, mc = 0;
+  bc_impedance(x, omega2, bc_bot, false, f, g, iPower, mc);
+
+  // Propagate through elastic layers below the acoustic region (bottom -> up)
+  if (last_acoustic < n_layers - 1) {
+    // Build initial yV from f, g (acoustic-to-elastic interface)
+    // For elastic half-space bottom BC, bc_impedance already set f,g correctly
+    // (f = omega2 * yV[3], g = yV[1])
+    // We need the full 5-component vector
+    double gammaS2 = x - omega2 / (bc_bot.cs * bc_bot.cs);
+    double gammaP2 = x - omega2 / (bc_bot.cp * bc_bot.cp);
+    double gammaS = gammaS2 >= 0 ? std::sqrt(gammaS2) : 0.0;
+    double gammaP = gammaP2 >= 0 ? std::sqrt(gammaP2) : 0.0;
+    double mu = bc_bot.rho * bc_bot.cs * bc_bot.cs;
+    double yV[5];
+    yV[0] = mu != 0.0 ? (gammaS * gammaP - x) / mu : 0.0;
+    yV[1] = ((gammaS2 + x) * (gammaS2 + x) - 4.0 * gammaS * gammaP * x) * mu;
+    yV[2] = 2.0 * gammaS * gammaP - gammaS2 - x;
+    yV[3] = gammaP * (x - gammaS2);
+    yV[4] = gammaS * (gammaS2 - x);
+
+    for (int64_t med = n_layers - 1; med > last_acoustic; --med) {
+      int64_t ns = layer_n[med] - 1;
+      elastic_compound_propagate(b1, b2, b3, b4, rho_full, x, yV,
+                                 layer_h[med], ns, layer_loc[med], true, iPower);
+    }
+    f = omega2 * yV[3];
+    g = yV[1];
+    if (g > 0.0) mc = 1; else mc = 0;
+  }
+
+  // Acoustic recurrence through acoustic layers
+  for (int64_t li = last_acoustic; li >= first_acoustic; --li) {
+    double h = layer_h[li];
+    double h2k2 = h * h * x;
+    double rho = layer_rho[li];
+    int64_t loc_s = layer_loc[li];
+    int64_t loc_e = loc_s + layer_n[li] - 1;
+
+    double p1v = -2.0 * g;
+    double p2v = (b1[loc_e] - h2k2) * g - 2.0 * h * f * rho;
+    double p0v = p1v;
+
+    int64_t sweep_len = loc_e - 1 - loc_s + 1;
+    for (int64_t s = 0; s < sweep_len; ++s) {
+      int64_t jj = (loc_e - 1) - s;
+      p0v = p1v;
+      p1v = p2v;
+      p2v = (h2k2 - b1[jj]) * p1v - p0v;
+    }
+
+    f = -(p2v - p0v) / (2.0 * h * rho);
+    g = -p1v;
+  }
+
+  // Top BC
+  double f_top, g_top;
+  int64_t ip_top = 0, mc_top = 0;
+
+  if (first_acoustic > 0) {
+    // Elastic layers above the acoustic region
+    bc_impedance(x, omega2, bc_top, true, f_top, g_top, ip_top, mc_top);
+
+    // Build yV from top BC
+    double yV_top[5];
+    if (bc_top.type == 0) { // vacuum
+      yV_top[0] = 1.0; yV_top[1] = 0.0; yV_top[2] = 0.0;
+      yV_top[3] = 0.0; yV_top[4] = 0.0;
+    } else if (bc_top.type == 1) { // rigid
+      yV_top[0] = 0.0; yV_top[1] = -1.0; yV_top[2] = 0.0;
+      yV_top[3] = 0.0; yV_top[4] = 0.0;
+    } else {
+      // Reconstruct full yV from half-space BC
+      double gS2 = x - omega2 / (bc_top.cs * bc_top.cs);
+      double gP2 = x - omega2 / (bc_top.cp * bc_top.cp);
+      double gS = gS2 >= 0 ? std::sqrt(gS2) : 0.0;
+      double gP = gP2 >= 0 ? std::sqrt(gP2) : 0.0;
+      double mu_t = bc_top.rho * bc_top.cs * bc_top.cs;
+      yV_top[0] = mu_t != 0.0 ? (gS * gP - x) / mu_t : 0.0;
+      yV_top[1] = ((gS2 + x) * (gS2 + x) - 4.0 * gS * gP * x) * mu_t;
+      yV_top[2] = 2.0 * gS * gP - gS2 - x;
+      yV_top[3] = gP * (x - gS2);
+      yV_top[4] = gS * (gS2 - x);
+    }
+
+    // Propagate down through elastic layers above acoustic region
+    for (int64_t med = 0; med < first_acoustic; ++med) {
+      int64_t ns = layer_n[med] - 1;
+      elastic_compound_propagate(b1, b2, b3, b4, rho_full, x, yV_top,
+                                 layer_h[med], ns, layer_loc[med], false, ip_top);
+    }
+
+    f_top = omega2 * yV_top[3];
+    g_top = -yV_top[1];  // negate for top BC convention
+    iPower += ip_top;
+  } else {
+    bc_impedance(x, omega2, bc_top, true, f_top, g_top, ip_top, mc_top);
+    iPower += ip_top;
+  }
+
+  double Delta = f * g_top - g * f_top;
+
+  if (g * Delta > 0.0)
+    mc += 1;
+
+  return {Delta, iPower, mc};
+}
+
+// elastic_solve1: grid scan + bisection for elastic eigenvalue problems.
+// Returns eigenvalues as a tensor.
+torch::Tensor elastic_solve1_cpp(
+    torch::Tensor B1, torch::Tensor B2, torch::Tensor B3, torch::Tensor B4,
+    torch::Tensor rho_full, int64_t n_layers, torch::Tensor layer_loc_t,
+    torch::Tensor layer_n_t, torch::Tensor layer_h_t, torch::Tensor layer_rho_t,
+    double omega2, int64_t bc_bot_type, double bc_bot_cp, double bc_bot_cs,
+    double bc_bot_rho, int64_t bc_top_type, double bc_top_cp, double bc_top_cs,
+    double bc_top_rho, int64_t first_acoustic, int64_t last_acoustic,
+    double x_min, double x_max, int64_t n_grid) {
+
+  const double *b1 = B1.data_ptr<double>();
+  const double *b2 = B2.data_ptr<double>();
+  const double *b3 = B3.data_ptr<double>();
+  const double *b4 = B4.data_ptr<double>();
+  const double *rho_f = rho_full.data_ptr<double>();
+  const int64_t *lloc = layer_loc_t.data_ptr<int64_t>();
+  const int64_t *ln = layer_n_t.data_ptr<int64_t>();
+  const double *lh = layer_h_t.data_ptr<double>();
+  const double *lrho = layer_rho_t.data_ptr<double>();
+
+  AcousticBC bc_bot{(int)bc_bot_type, bc_bot_cp, bc_bot_cs, bc_bot_rho};
+  AcousticBC bc_top{(int)bc_top_type, bc_top_cp, bc_top_cs, bc_top_rho};
+
+  // Grid scan for sign changes
+  std::vector<double> delta_signs(n_grid);
+  double dx = (x_max - x_min) / (double)(n_grid - 1);
+
+  for (int64_t i = 0; i < n_grid; ++i) {
+    double xi = x_min + i * dx;
+    auto r = dispersion_elastic_eval(xi, b1, b2, b3, b4, rho_f, n_layers,
+                                     lloc, ln, lh, lrho, omega2, bc_bot, bc_top,
+                                     first_acoustic, last_acoustic);
+    delta_signs[i] = r.Delta > 0 ? 1.0 : (r.Delta < 0 ? -1.0 : 0.0);
+  }
+
+  // Find sign changes and bisect
+  std::vector<double> roots;
+  roots.reserve(512);
+
+  for (int64_t i = 0; i < n_grid - 1; ++i) {
+    if (delta_signs[i] * delta_signs[i + 1] < 0) {
+      double a = x_min + i * dx;
+      double b = x_min + (i + 1) * dx;
+      double sa = delta_signs[i];
+
+      for (int iter = 0; iter < 60; ++iter) {
+        double c = 0.5 * (a + b);
+        auto rc = dispersion_elastic_eval(c, b1, b2, b3, b4, rho_f, n_layers,
+                                          lloc, ln, lh, lrho, omega2, bc_bot,
+                                          bc_top, first_acoustic, last_acoustic);
+        double sc = rc.Delta > 0 ? 1.0 : (rc.Delta < 0 ? -1.0 : 0.0);
+        if (sa * sc < 0) {
+          b = c;
+        } else {
+          a = c;
+          sa = sc;
+        }
+        if (std::abs(b - a) < 1e-15 * std::abs(a + b))
+          break;
+      }
+      double root = 0.5 * (a + b);
+      if (roots.empty() || std::abs(root - roots.back()) > 1e-12 * std::abs(root)) {
+        roots.push_back(root);
+      }
+    }
+  }
+
+  auto result = torch::empty({(int64_t)roots.size()}, torch::kFloat64);
+  double *rp = result.data_ptr<double>();
+  for (size_t i = 0; i < roots.size(); ++i)
+    rp[i] = roots[i];
+  return result;
 }
 
 } // namespace
@@ -1612,4 +1841,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("tridiag_inverse_iteration_batch", &tridiag_inverse_iteration_batch_cpp);
   m.def("fused_assembly_inverse_iteration", &fused_assembly_inverse_iteration_cpp);
   m.def("refine_roots", &refine_roots_cpp);
+  m.def("elastic_solve1", &elastic_solve1_cpp);
 }

@@ -50,6 +50,95 @@ def _lorentz_inv(z: torch.Tensor, eps: float) -> torch.Tensor:
     return z / (z * z + eps * eps)
 
 
+def _ift_forward_sweep(x_m, B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n, f_bot, g_bot):
+    """Forward recurrence through acoustic layers. Returns per-layer cache for backward."""
+    f_in = [None] * n_layers
+    g_in = [None] * n_layers
+    h2k2_l = [None] * n_layers
+    p1i_l = [None] * n_layers
+    p2i_l = [None] * n_layers
+    ph_l = [None] * n_layers
+
+    f_cur, g_cur = f_bot, g_bot
+    for rev_idx in range(n_layers):
+        li = n_layers - 1 - rev_idx
+        h = layer_h[li]
+        rho = layer_rho[li]
+        loc = int(layer_loc[li].item())
+        n_pts = int(layer_n[li].item())
+        loc_end = loc + n_pts - 1
+
+        f_in[li] = f_cur
+        g_in[li] = g_cur
+
+        h2k2 = (h * h * x_m).reshape(1)
+        p1_init = (-2.0 * g_cur).reshape(1)
+        p2_init = ((B1_c[loc_end] - h2k2[0]) * g_cur - 2.0 * h * f_cur * rho).reshape(1)
+        f_num, g_val, p_history = AcousticRecurrenceFn.apply(
+            B1_c, h2k2, loc, loc_end - 1, p1_init, p2_init,
+        )
+        h2k2_l[li] = h2k2
+        p1i_l[li] = p1_init
+        p2i_l[li] = p2_init
+        ph_l[li] = p_history
+
+        f_cur = f_num[0] / (2.0 * h * rho)
+        g_cur = g_val[0]
+
+    return f_cur, g_cur, f_in, g_in, h2k2_l, p1i_l, p2i_l, ph_l
+
+
+def _ift_backward_sweep(
+    B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n,
+    g_in, h2k2_l, p1i_l, p2i_l, ph_l, is_complex,
+):
+    """Backward recurrence through acoustic layers.
+
+    Returns (grad_f_bot, grad_g_bot, dDelta_dx, grad_B1_delta).
+    Caller handles BC-specific derivatives outside.
+    """
+    device = B1_c.device
+    dtype = torch.complex128 if is_complex else torch.float64
+    grad_f_cur = torch.zeros((), dtype=dtype, device=device)
+    grad_g_cur = -torch.ones((), dtype=dtype, device=device) if is_complex else (
+        -torch.ones((), dtype=dtype, device=device)
+    )
+    dDelta_dx = torch.zeros((), dtype=dtype, device=device)
+    grad_B1_delta = torch.zeros_like(B1_c)
+
+    for li in range(n_layers):
+        h = layer_h[li]
+        rho = layer_rho[li]
+        loc = int(layer_loc[li].item())
+        n_pts = int(layer_n[li].item())
+        loc_end = loc + n_pts - 1
+
+        grad_f_num = (grad_f_cur / (2.0 * h * rho)).reshape(1)
+        grad_g_val = grad_g_cur.reshape(1)
+
+        grad_B1_layer, grad_h2k2_layer, grad_p1i_layer, grad_p2i_layer = (
+            _run_recurrence_bwd(
+                grad_f_num, grad_g_val, B1_c,
+                h2k2_l[li], ph_l[li], loc, loc_end - 1,
+                p1i_l[li], p2i_l[li], False,
+            )
+        )
+
+        grad_B1_delta += grad_B1_layer
+        grad_B1_delta[loc_end] += grad_p2i_layer[0] * g_in[li]
+
+        grad_h2k2_total = grad_h2k2_layer[0] - grad_p2i_layer[0] * g_in[li]
+        dDelta_dx = dDelta_dx + grad_h2k2_total * (h * h)
+
+        grad_f_cur = -2.0 * h * rho * grad_p2i_layer[0]
+        grad_g_cur = (
+            -2.0 * grad_p1i_layer[0]
+            + (B1_c[loc_end] - h2k2_l[li][0]) * grad_p2i_layer[0]
+        )
+
+    return grad_f_cur, grad_g_cur, dDelta_dx, grad_B1_delta
+
+
 class KrakenEigenvalueIFT(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -807,15 +896,8 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_x):
         (
-            x_converged,
-            B1,
-            layer_h,
-            layer_rho,
-            layer_loc,
-            layer_n,
-            branch_signs,
-            c_bot,
-            rho_bot,
+            x_converged, B1, layer_h, layer_rho, layer_loc, layer_n,
+            branch_signs, c_bot, rho_bot,
         ) = ctx.saved_tensors
         omega2 = ctx.omega2
         c_imag = ctx.c_imag
@@ -829,13 +911,6 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
         grad_B1_total = torch.zeros_like(B1)
         grad_c_bot = torch.zeros_like(c_bot)
         grad_rho_bot = torch.zeros_like(rho_bot)
-
-        f_in_layers = [None] * n_layers
-        g_in_layers = [None] * n_layers
-        h2k2_layers = [None] * n_layers
-        p1_init_layers = [None] * n_layers
-        p2_init_layers = [None] * n_layers
-        p_history_layers = [None] * n_layers
 
         cp_c = torch.complex(
             c_bot.detach(), torch.tensor(c_imag, dtype=c_bot.dtype, device=c_bot.device)
@@ -853,93 +928,19 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
             f_bot = branch_sign * f_sqrt
             g_bot = rho_bot.detach().to(torch.complex128)
             dfdx_bot = branch_sign * 0.5 / f_sqrt
-            dfdcp = branch_sign * omega2 / (cp_c * cp_c * cp_c * f_sqrt)
-            dfdc_bot = dfdcp * dcp_dc
+            dfdc_bot = branch_sign * omega2 / (cp_c**3 * f_sqrt) * dcp_dc
 
-            f_cur = f_bot
-            g_cur = g_bot
+            _, _, f_in, g_in, h2k2_l, p1i_l, p2i_l, ph_l = _ift_forward_sweep(
+                x_m, B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n, f_bot, g_bot,
+            )
+            grad_f_bot, grad_g_bot, dDelta_dx, grad_B1_delta = _ift_backward_sweep(
+                B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n,
+                g_in, h2k2_l, p1i_l, p2i_l, ph_l, True,
+            )
 
-            for rev_idx in range(n_layers):
-                layer_idx = n_layers - 1 - rev_idx
-                h = layer_h[layer_idx]
-                rho = layer_rho[layer_idx]
-                loc = int(layer_loc[layer_idx].item())
-                n_pts = int(layer_n[layer_idx].item())
-                loc_end = loc + n_pts - 1
-
-                f_in_layers[layer_idx] = f_cur
-                g_in_layers[layer_idx] = g_cur
-
-                h2k2 = (h * h * x_m).reshape(1)
-                p1_init = (-2.0 * g_cur).reshape(1)
-                p2_init = ((B1_c[loc_end] - h2k2[0]) * g_cur - 2.0 * h * f_cur * rho).reshape(1)
-                f_num, g_val, p_history = AcousticRecurrenceFn.apply(
-                    B1_c,
-                    h2k2,
-                    loc,
-                    loc_end - 1,
-                    p1_init,
-                    p2_init,
-                )
-
-                h2k2_layers[layer_idx] = h2k2
-                p1_init_layers[layer_idx] = p1_init
-                p2_init_layers[layer_idx] = p2_init
-                p_history_layers[layer_idx] = p_history
-
-                f_cur = f_num[0] / (2.0 * h * rho)
-                g_cur = g_val[0]
-
-            grad_f_cur = x_m.new_zeros(())
-            grad_g_cur = -torch.ones((), dtype=torch.complex128, device=x_m.device)
-            dDelta_dx = x_m.new_zeros(())
-            grad_B1_delta = torch.zeros_like(B1_c)
-
-            for layer_idx in range(n_layers):
-                h = layer_h[layer_idx]
-                rho = layer_rho[layer_idx]
-                loc = int(layer_loc[layer_idx].item())
-                n_pts = int(layer_n[layer_idx].item())
-                loc_end = loc + n_pts - 1
-                g_in = g_in_layers[layer_idx]
-
-                grad_f_num = (grad_f_cur / (2.0 * h * rho)).reshape(1)
-                grad_g_val = grad_g_cur.reshape(1)
-
-                # The complex dispersion function is holomorphic in h2k2 and B1.
-                # The adjoint for a holomorphic function does NOT conjugate the
-                # forward coefficients (Wirtinger ∂f/∂z̄ = 0 for holomorphic f).
-                # Using complex_case=False gives the correct ordinary derivative.
-                grad_B1_layer, grad_h2k2_layer, grad_p1i_layer, grad_p2i_layer = (
-                    _run_recurrence_bwd(
-                        grad_f_num,
-                        grad_g_val,
-                        B1_c,
-                        h2k2_layers[layer_idx],
-                        p_history_layers[layer_idx],
-                        loc,
-                        loc_end - 1,
-                        p1_init_layers[layer_idx],
-                        p2_init_layers[layer_idx],
-                        False,
-                    )
-                )
-
-                grad_B1_delta += grad_B1_layer
-                grad_B1_delta[loc_end] += grad_p2i_layer[0] * g_in
-
-                grad_h2k2_total = grad_h2k2_layer[0] - grad_p2i_layer[0] * g_in
-                dDelta_dx = dDelta_dx + grad_h2k2_total * (h * h)
-
-                grad_f_cur = -2.0 * h * rho * grad_p2i_layer[0]
-                grad_g_cur = (
-                    -2.0 * grad_p1i_layer[0]
-                    + (B1_c[loc_end] - h2k2_layers[layer_idx][0]) * grad_p2i_layer[0]
-                )
-
-            dDelta_dx = dDelta_dx + grad_f_cur * dfdx_bot
-            dDelta_dc = grad_f_cur * dfdc_bot
-            dDelta_drho = grad_g_cur
+            dDelta_dx = dDelta_dx + grad_f_bot * dfdx_bot
+            dDelta_dc = grad_f_bot * dfdc_bot
+            dDelta_drho = grad_g_bot
 
             ift_scale = -grad_x[m].conj() * _lorentz_inv(dDelta_dx, eps)
             grad_B1_total = grad_B1_total + (ift_scale * grad_B1_delta).real.to(B1.dtype)
@@ -947,19 +948,8 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
             grad_rho_bot = grad_rho_bot + (ift_scale * dDelta_drho).real.to(rho_bot.dtype)
 
         return (
-            None,
-            grad_B1_total,
-            None,
-            None,
-            None,
-            None,
-            None,
-            grad_c_bot,
-            grad_rho_bot,
-            None,
-            None,
-            None,
-            None,
+            None, grad_B1_total, None, None, None, None, None,
+            grad_c_bot, grad_rho_bot, None, None, None, None,
         )
 
 
@@ -996,10 +986,183 @@ def krakenc_vacuum_acoustic_bottom_ift(
     )
 
 
+def _elastic_bc(x, omega2, cp_c, cs_c, rho):
+    """Elastic halfspace BC: returns (f, g) as differentiable torch scalars."""
+    gammaS2 = x - omega2 / (cs_c * cs_c)
+    gammaP2 = x - omega2 / (cp_c * cp_c)
+    gammaS = torch.sqrt(gammaS2)
+    gammaP = torch.sqrt(gammaP2)
+    mu = rho * cs_c * cs_c
+    f = omega2 * gammaP * (x - gammaS2)
+    g = ((gammaS2 + x) ** 2 - 4.0 * gammaS * gammaP * x) * mu
+    return f, g
+
+
+class KrakencVacuumElasticBottomIFT(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        x_converged: torch.Tensor,
+        B1: torch.Tensor,
+        layer_h: torch.Tensor,
+        layer_rho: torch.Tensor,
+        layer_loc: torch.Tensor,
+        layer_n: torch.Tensor,
+        c_bot: torch.Tensor,
+        cs_bot: torch.Tensor,
+        rho_bot: torch.Tensor,
+        omega2: float,
+        c_imag: float,
+        dc_imag_dc: float,
+        cs_imag: float,
+        dcs_imag_dcs: float,
+        eps: float,
+    ):
+        return x_converged.detach().clone()
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        (
+            x_converged, B1, layer_h, layer_rho, layer_loc, layer_n,
+            c_bot, cs_bot, rho_bot,
+            omega2, c_imag, dc_imag_dc, cs_imag, dcs_imag_dcs, eps,
+        ) = inputs
+        ctx.omega2 = omega2
+        ctx.c_imag = c_imag
+        ctx.dc_imag_dc = dc_imag_dc
+        ctx.cs_imag = cs_imag
+        ctx.dcs_imag_dcs = dcs_imag_dcs
+        ctx.eps = eps
+        ctx.save_for_backward(
+            x_converged, B1, layer_h, layer_rho, layer_loc, layer_n,
+            c_bot, cs_bot, rho_bot,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_x):
+        (
+            x_converged, B1, layer_h, layer_rho, layer_loc, layer_n,
+            c_bot, cs_bot, rho_bot,
+        ) = ctx.saved_tensors
+        omega2 = ctx.omega2
+        eps = ctx.eps
+
+        M = x_converged.shape[0]
+        n_layers = layer_h.shape[0]
+        B1_c = B1.detach().to(torch.complex128)
+
+        grad_B1_total = torch.zeros_like(B1)
+        grad_c_bot = torch.zeros_like(c_bot)
+        grad_cs_bot = torch.zeros_like(cs_bot)
+        grad_rho_bot = torch.zeros_like(rho_bot)
+
+        # Complex bottom BC parameters
+        cp_c = torch.complex(
+            c_bot.detach().to(torch.float64),
+            torch.tensor(ctx.c_imag, dtype=torch.float64),
+        )
+        cs_c = torch.complex(
+            cs_bot.detach().to(torch.float64),
+            torch.tensor(ctx.cs_imag, dtype=torch.float64),
+        )
+        rho_c = rho_bot.detach().to(torch.complex128)
+
+        # Derivatives of complex sound speeds w.r.t. real parameters
+        dcp_dc = torch.complex(
+            torch.ones((), dtype=torch.float64),
+            torch.tensor(ctx.dc_imag_dc, dtype=torch.float64),
+        )
+        dcs_dcs = torch.complex(
+            torch.ones((), dtype=torch.float64),
+            torch.tensor(ctx.dcs_imag_dcs, dtype=torch.float64),
+        )
+
+        for m in range(M):
+            x_m = x_converged[m].detach().to(torch.complex128)
+
+            # Compute elastic BC and derivatives using autograd.
+            # Need enable_grad() because we're inside backward() which disables grad.
+            with torch.enable_grad():
+                x_ad = x_m.clone().requires_grad_(True)
+                cp_ad = cp_c.clone().requires_grad_(True)
+                cs_ad = cs_c.clone().requires_grad_(True)
+                rho_ad = rho_c.clone().requires_grad_(True)
+
+                f_bot, g_bot = _elastic_bc(x_ad, omega2, cp_ad, cs_ad, rho_ad)
+                ones = torch.ones_like(f_bot)
+
+                # df/dx, dg/dx (holomorphic => use grad_outputs=1, not conjugate)
+                dfdx = torch.autograd.grad(f_bot, x_ad, grad_outputs=ones, retain_graph=True)[0]
+                dgdx = torch.autograd.grad(g_bot, x_ad, grad_outputs=ones, retain_graph=True)[0]
+
+                # df/dcp, dg/dcp (chain rule: d/dc_bot = d/dcp_c * dcp_dc)
+                dfdcp = torch.autograd.grad(f_bot, cp_ad, grad_outputs=ones, retain_graph=True)[0]
+                dgdcp = torch.autograd.grad(g_bot, cp_ad, grad_outputs=ones, retain_graph=True)[0]
+                dfdc_bot = dfdcp * dcp_dc
+                dgdc_bot = dgdcp * dcp_dc
+
+                # df/dcs, dg/dcs
+                dfdcs = torch.autograd.grad(f_bot, cs_ad, grad_outputs=ones, retain_graph=True)[0]
+                dgdcs = torch.autograd.grad(g_bot, cs_ad, grad_outputs=ones, retain_graph=True)[0]
+                dfdcs_bot = dfdcs * dcs_dcs
+                dgdcs_bot = dgdcs * dcs_dcs
+
+                # df/drho, dg/drho (f doesn't depend on rho, so allow_unused)
+                dfdrho_t = torch.autograd.grad(f_bot, rho_ad, grad_outputs=ones, retain_graph=True, allow_unused=True)[0]
+                dfdrho = dfdrho_t if dfdrho_t is not None else torch.zeros_like(rho_ad)
+                dgdrho = torch.autograd.grad(g_bot, rho_ad, grad_outputs=ones)[0]
+
+            _, _, f_in, g_in, h2k2_l, p1i_l, p2i_l, ph_l = _ift_forward_sweep(
+                x_m, B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n,
+                f_bot.detach(), g_bot.detach(),
+            )
+            grad_f_bot, grad_g_bot, dDelta_dx, grad_B1_delta = _ift_backward_sweep(
+                B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n,
+                g_in, h2k2_l, p1i_l, p2i_l, ph_l, True,
+            )
+
+            # Add BC derivatives: dDelta/dx from BC
+            dDelta_dx = dDelta_dx + grad_f_bot * dfdx.detach() + grad_g_bot * dgdx.detach()
+
+            # Parameter derivatives
+            dDelta_dc = grad_f_bot * dfdc_bot.detach() + grad_g_bot * dgdc_bot.detach()
+            dDelta_dcs = grad_f_bot * dfdcs_bot.detach() + grad_g_bot * dgdcs_bot.detach()
+            dDelta_drho = grad_f_bot * dfdrho.detach() + grad_g_bot * dgdrho.detach()
+
+            ift_scale = -grad_x[m].conj() * _lorentz_inv(dDelta_dx, eps)
+            grad_B1_total = grad_B1_total + (ift_scale * grad_B1_delta).real.to(B1.dtype)
+            grad_c_bot = grad_c_bot + (ift_scale * dDelta_dc).real.to(c_bot.dtype)
+            grad_cs_bot = grad_cs_bot + (ift_scale * dDelta_dcs).real.to(cs_bot.dtype)
+            grad_rho_bot = grad_rho_bot + (ift_scale * dDelta_drho).real.to(rho_bot.dtype)
+
+        return (
+            None,       # x_converged
+            grad_B1_total,
+            None, None, None, None,  # layer_h, layer_rho, layer_loc, layer_n
+            grad_c_bot,
+            grad_cs_bot,
+            grad_rho_bot,
+            None, None, None, None, None, None,  # omega2, c_imag, dc_imag_dc, cs_imag, dcs_imag_dcs, eps
+        )
+
+
+def krakenc_vacuum_elastic_bottom_ift(
+    x_converged, B1, layer_h, layer_rho, layer_loc, layer_n,
+    c_bot, cs_bot, rho_bot, omega2,
+    c_imag, dc_imag_dc, cs_imag, dcs_imag_dcs,
+    *, eps=1e-12,
+):
+    return KrakencVacuumElasticBottomIFT.apply(
+        x_converged, B1, layer_h, layer_rho, layer_loc, layer_n,
+        c_bot, cs_bot, rho_bot, omega2,
+        c_imag, dc_imag_dc, cs_imag, dcs_imag_dcs, eps,
+    )
+
+
 __all__ = [
     "KrakenEigenvalueIFT",
     "kraken_eigenvalue_ift",
     "kraken_multilayer_ift",
     "kraken_acoustic_bottom_ift",
     "krakenc_vacuum_acoustic_bottom_ift",
+    "krakenc_vacuum_elastic_bottom_ift",
 ]
