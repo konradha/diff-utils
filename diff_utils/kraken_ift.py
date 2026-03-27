@@ -418,21 +418,9 @@ def kraken_eigenvalue_ift(
     eps: float = 1e-12,
 ) -> torch.Tensor:
     return KrakenEigenvalueIFT.apply(
-        x_converged,
-        B1,
-        rho_med,
-        h_med,
-        loc_start,
-        loc_end,
-        f_bc_top,
-        g_bc_top,
-        f_bc_bot,
-        g_bc_bot,
-        dfdx_top,
-        dgdx_top,
-        dfdx_bot,
-        dgdx_bot,
-        eps,
+        x_converged, B1, rho_med, h_med, loc_start, loc_end,
+        f_bc_top, g_bc_top, f_bc_bot, g_bc_bot,
+        dfdx_top, dgdx_top, dfdx_bot, dgdx_bot, eps,
     )
 
 
@@ -1250,6 +1238,9 @@ def krakenc_vacuum_elastic_bottom_ift(
         c_imag, dc_imag_dc, cs_imag, dcs_imag_dcs, eps,
     )
 
+
+# Backward-compatible aliases
+eigenvalue_ift = None  # imported from eigenvalue_ift module
 
 __all__ = [
     "KrakenEigenvalueIFT",
