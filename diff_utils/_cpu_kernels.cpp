@@ -2424,6 +2424,229 @@ torch::Tensor field3d_gbt_cpp(
   return P_t;
 }
 
+// ---------------------------------------------------------------------------
+// FIELD3D GBT backward: re-execute forward, accumulate dP/d(node_k) and dP/d(node_phi).
+// Uses the same beam tracing as forward but instead of accumulating P,
+// propagates grad_P back to node_k and node_phi_r via the contribution formula.
+// ---------------------------------------------------------------------------
+
+std::tuple<torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp(
+    torch::Tensor grad_P,       // [N_theta, N_r] complex128
+    // Same inputs as forward:
+    torch::Tensor node_x, torch::Tensor node_y,
+    torch::Tensor elements, torch::Tensor adjacency,
+    torch::Tensor node_k, torch::Tensor node_phi_s, torch::Tensor node_phi_r,
+    torch::Tensor node_M_t,
+    double sx, double sy, int64_t ie_src,
+    double alpha1_deg, double alpha2_deg, int64_t n_alpha,
+    double step_size, int64_t n_steps, double eps_mult,
+    torch::Tensor rad_cos, torch::Tensor rad_sin,
+    double r_min, double r_max, int64_t n_r,
+    int64_t M_limit, char beam_type
+) {
+  using C = c10::complex<double>;
+  const double PI = 3.141592653589793;
+  const double BEAM_WINDOW = 5.0;
+
+  int64_t n_theta = rad_cos.size(0);
+  int64_t n_nodes = node_x.size(0);
+  int64_t M_max = node_k.size(1);
+  double delta_r = (r_max - r_min) / std::max(n_r - 1, (int64_t)1);
+  double alpha1 = alpha1_deg * PI / 180.0;
+  double alpha2 = alpha2_deg * PI / 180.0;
+  double d_alpha = (alpha2 - alpha1) / std::max(n_alpha - 1, (int64_t)1);
+
+  const double *nx_p = node_x.data_ptr<double>();
+  const double *ny_p = node_y.data_ptr<double>();
+  const int64_t *elt = elements.data_ptr<int64_t>();
+  const int64_t *adj_p = adjacency.data_ptr<int64_t>();
+  const C *nk = reinterpret_cast<const C*>(node_k.data_ptr());
+  const C *nps = reinterpret_cast<const C*>(node_phi_s.data_ptr());
+  const C *npr = reinterpret_cast<const C*>(node_phi_r.data_ptr());
+  const int64_t *nM = node_M_t.data_ptr<int64_t>();
+  const double *rc = rad_cos.data_ptr<double>();
+  const double *rs = rad_sin.data_ptr<double>();
+  const C *gP = reinterpret_cast<const C*>(grad_P.data_ptr());
+
+  // Output gradients
+  auto grad_k = torch::zeros_like(node_k);
+  auto grad_phi_r = torch::zeros_like(node_phi_r);
+  C *gk = reinterpret_cast<C*>(grad_k.data_ptr());
+  C *gpr = reinterpret_cast<C*>(grad_phi_r.data_ptr());
+
+  // Re-use get_elt from forward (same lambda)
+  auto get_elt = [&](int64_t ie, int64_t mode,
+      double &x1, double &y1, double &x2, double &y2, double &x3, double &y3,
+      double &D12, double &D13, double &D23, double &delta,
+      int64_t &s1, int64_t &s2, int64_t &s3, int64_t &Mprop,
+      C &cx_out, C &cy_out) -> bool {
+    s1 = elt[ie*3]; s2 = elt[ie*3+1]; s3 = elt[ie*3+2];
+    Mprop = std::min({nM[s1], nM[s2], nM[s3], M_max});
+    if (mode >= Mprop) return false;
+    x1 = nx_p[s1]; y1 = ny_p[s1]; x2 = nx_p[s2]; y2 = ny_p[s2]; x3 = nx_p[s3]; y3 = ny_p[s3];
+    D12 = x1*y2 - y1*x2; D13 = x1*y3 - y1*x3; D23 = x2*y3 - y2*x3;
+    delta = D23 - D13 + D12;
+    if (std::abs(delta) < 1e-30) return false;
+    C k1 = nk[s1*M_max+mode], k2 = nk[s2*M_max+mode], k3 = nk[s3*M_max+mode];
+    double A1x=-y3+y2, A2x=y3-y1, A3x=-y2+y1;
+    double A1y=x3-x2, A2y=-x3+x1, A3y=x2-x1;
+    cx_out = (A1x/k1 + A2x/k2 + A3x/k3) / delta;
+    cy_out = (A1y/k1 + A2y/k2 + A3y/k3) / delta;
+    return true;
+  };
+
+  // Re-execute forward beam tracing, accumulate gradients at each hit
+  for (int64_t ia = 0; ia < n_alpha; ++ia) {
+    double alpha = alpha1 + ia * d_alpha;
+    double tsx = std::cos(alpha), tsy = std::sin(alpha);
+
+    for (int64_t mode = 0; mode < M_limit; ++mode) {
+      double x1,y1,x2,y2,x3,y3,D12,D13,D23,delta;
+      int64_t s1,s2,s3,Mprop;
+      C cx, cy;
+      int64_t ie = ie_src;
+
+      if (!get_elt(ie, mode, x1,y1,x2,y2,x3,y3,D12,D13,D23,delta,s1,s2,s3,Mprop,cx,cy))
+        continue;
+
+      double DB1=sx*y1-sy*x1, DB2=sx*y2-sy*x2, DB3=sx*y3-sy*x3;
+      double A1=(D23-DB3+DB2)/delta, A2=(DB3-D13-DB1)/delta, A3=(-DB2+DB1+D12)/delta;
+
+      C cA = A1/nk[s1*M_max+mode] + A2/nk[s2*M_max+mode] + A3/nk[s3*M_max+mode];
+      C phi_src = A1*nps[s1*M_max+mode] + A2*nps[s2*M_max+mode] + A3*nps[s3*M_max+mode];
+
+      double Hwidth;
+      if (beam_type == 'F') Hwidth = 2.0 / (std::real(C(1.0)/cA) * d_alpha);
+      else Hwidth = std::sqrt(2.0 * std::real(cA) * r_max);
+      double EpsOpt = 0.5 * Hwidth * Hwidth;
+      C eps = C(0.0, eps_mult * EpsOpt);
+      C cnst = phi_src * std::sqrt(eps / cA) * d_alpha;
+
+      double xA=sx, yA=sy;
+      double xiA=tsx/std::real(cA), etaA=tsy/std::real(cA);
+      C pA(1.0), qA=eps, tauA(0.0);
+      int KMAHA = 1;
+      C phiA = A1*npr[s1*M_max+mode] + A2*npr[s2*M_max+mode] + A3*npr[s3*M_max+mode];
+
+      // Track current element's node indices for gradient accumulation
+      int64_t cur_s1=s1, cur_s2=s2, cur_s3=s3;
+      double cur_A1=A1, cur_A2=A2, cur_A3=A3;
+      bool exited = false;
+
+      for (int64_t istep = 0; istep < n_steps; ++istep) {
+        double cA_r = std::real(cA);
+        double xB = xA + step_size * cA_r * xiA;
+        double yB = yA + step_size * cA_r * etaA;
+        double xiB = xiA - step_size * std::real(cx / (cA*cA));
+        double etaB = etaA - step_size * std::real(cy / (cA*cA));
+        C pB = pA;
+        C qB = qA + step_size * cA_r * pA;
+        C tauB = tauA + step_size / cA;
+
+        int KMAHB = KMAHA;
+        if (std::real(qB) < 0.0) {
+          if ((std::imag(qA) < 0 && std::imag(qB) >= 0) ||
+              (std::imag(qA) > 0 && std::imag(qB) <= 0)) KMAHB = -KMAHA;
+        }
+
+        C cB = cA, phiB = phiA;
+        int64_t B_s1=cur_s1, B_s2=cur_s2, B_s3=cur_s3;
+        double B_A1=cur_A1, B_A2=cur_A2, B_A3=cur_A3;
+
+        if (!exited) {
+          DB1=xB*y1-yB*x1; DB2=xB*y2-yB*x2; DB3=xB*y3-yB*x3;
+          A1=(D23-DB3+DB2)/delta; A2=(DB3-D13-DB1)/delta; A3=(-DB2+DB1+D12)/delta;
+
+          for (int cross = 0; cross < 100 && (A1<0||A2<0||A3<0); ++cross) {
+            int side = (A3<0) ? 0 : (A1<0 ? 1 : 2);
+            int64_t next = adj_p[ie*3+side];
+            if (next < 0) { exited = true; cx=C(0); cy=C(0); break; }
+            ie = next;
+            if (!get_elt(ie,mode,x1,y1,x2,y2,x3,y3,D12,D13,D23,delta,s1,s2,s3,Mprop,cx,cy))
+              { exited = true; break; }
+            if (mode >= Mprop) { exited = true; break; }
+            DB1=xB*y1-yB*x1; DB2=xB*y2-yB*x2; DB3=xB*y3-yB*x3;
+            A1=(D23-DB3+DB2)/delta; A2=(DB3-D13-DB1)/delta; A3=(-DB2+DB1+D12)/delta;
+          }
+          if (!exited) {
+            cB = A1/nk[s1*M_max+mode]+A2/nk[s2*M_max+mode]+A3/nk[s3*M_max+mode];
+            phiB = A1*npr[s1*M_max+mode]+A2*npr[s2*M_max+mode]+A3*npr[s3*M_max+mode];
+            B_s1=s1; B_s2=s2; B_s3=s3;
+            B_A1=A1; B_A2=A2; B_A3=A3;
+          }
+        }
+
+        // Backward influence: same loop as forward but accumulate gradients
+        double _xA=xA-sx, _yA=yA-sy, _xB=xB-sx, _yB=yB-sy;
+        for (int64_t it = 0; it < n_theta; ++it) {
+          double rv1=rc[it], rv2=rs[it];
+          double dA = rv1*xiA + rv2*etaA;
+          double dB = rv1*xiB + rv2*etaB;
+          if (std::abs(dA)<1e-30 || std::abs(dB)<1e-30 || dA*dB<=0) continue;
+          double rA_v = (_yA*etaA+_xA*xiA)/dA;
+          double rB_v = (_yB*etaB+_xB*xiB)/dB;
+          int64_t ir1 = std::max(std::min((int64_t)((rA_v-r_min)/delta_r)+1, n_r), (int64_t)0);
+          int64_t ir2 = std::max(std::min((int64_t)((rB_v-r_min)/delta_r)+1, n_r), (int64_t)1);
+          if (ir2 <= ir1) continue;
+          double nA_v = (_xA*rv2-_yA*rv1)/(cA_r*dA);
+          double nB_v = (_xB*rv2-_yB*rv1)/(std::real(cB)*dB);
+          double rBA = rB_v - rA_v;
+          if (std::abs(rBA) < 1e-30) continue;
+          for (int64_t ir = ir1+1; ir <= std::min(ir2, n_r); ++ir) {
+            double W = (r_min + (ir-1)*delta_r - rA_v) / rBA;
+            C pM = pA + W*(pB-pA);
+            C qM = qA + W*(qB-qA);
+            double n2 = (nA_v + W*(nB_v-nA_v)); n2 = n2*n2;
+            if (qM != C(0) && -0.5*std::imag(pM/qM)*n2 < BEAM_WINDOW) {
+              C cM = cA + W*(cB-cA);
+              C tM = tauA + W*(tauB-tauA);
+              C phM = phiA + W*(phiB-phiA);
+              int km = KMAHA;
+              if (std::real(qM)<0) {
+                if ((std::imag(qA)<0 && std::imag(qM)>=0)||(std::imag(qA)>0 && std::imag(qM)<=0))
+                  km = -km;
+              }
+              C contrib = cnst * phM * std::sqrt(cM/qM) * std::exp(C(0,-1)*(tM + C(0.5)*pM/qM*n2));
+              if (km < 0) contrib = -contrib;
+
+              // grad_P contribution
+              C gp = gP[it*n_r + ir-1];
+              if (std::abs(gp) < 1e-30) continue;
+
+              // d(contrib)/d(phiB) = W * contrib/phM (phi enters linearly)
+              if (std::abs(phM) > 1e-30) {
+                C dcdphi = W * contrib / phM;
+                C grad_phi_contrib = gp * dcdphi;
+                // Distribute to nodes at B via barycentric
+                gpr[B_s1*M_max+mode] += std::conj(grad_phi_contrib) * C(B_A1);
+                gpr[B_s2*M_max+mode] += std::conj(grad_phi_contrib) * C(B_A2);
+                gpr[B_s3*M_max+mode] += std::conj(grad_phi_contrib) * C(B_A3);
+              }
+
+              // d(contrib)/d(cB) → d(cB)/d(ki) = -Ai/ki²
+              if (std::abs(cM) > 1e-30) {
+                C dcdc = W * contrib * C(0.5) / cM;  // from sqrt(cM/qM) term
+                C grad_c_contrib = gp * dcdc;
+                C k1 = nk[B_s1*M_max+mode], k2 = nk[B_s2*M_max+mode], k3 = nk[B_s3*M_max+mode];
+                gk[B_s1*M_max+mode] += std::conj(grad_c_contrib) * C(-B_A1) / (k1*k1);
+                gk[B_s2*M_max+mode] += std::conj(grad_c_contrib) * C(-B_A2) / (k2*k2);
+                gk[B_s3*M_max+mode] += std::conj(grad_c_contrib) * C(-B_A3) / (k3*k3);
+              }
+            }
+          }
+        }
+
+        xA=xB; yA=yB; xiA=xiB; etaA=etaB;
+        pA=pB; qA=qB; tauA=tauB; cA=cB;
+        KMAHA=KMAHB; phiA=phiB;
+        cur_s1=B_s1; cur_s2=B_s2; cur_s3=B_s3;
+        cur_A1=B_A1; cur_A2=B_A2; cur_A3=B_A3;
+      }
+    }
+  }
+  return std::make_tuple(grad_k, grad_phi_r);
+}
+
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -2450,4 +2673,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("elastic_solve1", &elastic_solve1_cpp);
   m.def("krakenc_fused", &krakenc_fused_cpp);
   m.def("field3d_gbt", &field3d_gbt_cpp);
+  m.def("field3d_gbt_backward", &field3d_gbt_backward_cpp);
 }
