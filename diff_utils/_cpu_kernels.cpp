@@ -2224,6 +2224,206 @@ krakenc_fused_cpp(
   return std::make_tuple(x_out, signs_out, phi, needs_phi_t);
 }
 
+// ---------------------------------------------------------------------------
+// FIELD3D GBT: Gaussian Beam Tracing kernel.
+// Traces beams through triangular mesh, deposits contributions on receiver
+// radials. All beam stepping + influence in one C++ call.
+// ---------------------------------------------------------------------------
+
+torch::Tensor field3d_gbt_cpp(
+    // Mesh: nodes and connectivity
+    torch::Tensor node_x,       // [N_nodes] float64 — x coordinates (meters)
+    torch::Tensor node_y,       // [N_nodes] float64 — y coordinates
+    torch::Tensor elements,     // [N_elt, 3] int64 — 0-based node indices
+    torch::Tensor adjacency,    // [N_elt, 3] int64 — neighbor per side (-1 = boundary)
+    // Per-node modal data
+    torch::Tensor node_k,       // [N_nodes, M_max] complex128 — wavenumbers
+    torch::Tensor node_phi_s,   // [N_nodes, M_max] complex128 — phi at source depth
+    torch::Tensor node_phi_r,   // [N_nodes, M_max] complex128 — phi at receiver depth
+    torch::Tensor node_M,       // [N_nodes] int64 — mode count per node
+    // Source
+    double sx, double sy,
+    int64_t ie_src,             // source element index
+    // Beam params
+    double alpha1_deg, double alpha2_deg, int64_t n_alpha,
+    double step_size, int64_t n_steps, double eps_mult,
+    // Receiver grid
+    torch::Tensor rad_cos,      // [N_theta] float64
+    torch::Tensor rad_sin,      // [N_theta] float64
+    double r_min, double r_max, int64_t n_r,
+    // Limits
+    int64_t M_limit,
+    char beam_type              // 'F' or 'M'
+) {
+  using C = c10::complex<double>;
+  const double PI = 3.141592653589793;
+  const double BEAM_WINDOW = 5.0;
+
+  int64_t n_theta = rad_cos.size(0);
+  int64_t n_nodes = node_x.size(0);
+  int64_t n_elt = elements.size(0);
+  int64_t M_max = node_k.size(1);
+  double delta_r = (r_max - r_min) / std::max(n_r - 1, (int64_t)1);
+
+  double alpha1 = alpha1_deg * PI / 180.0;
+  double alpha2 = alpha2_deg * PI / 180.0;
+  double d_alpha = (alpha2 - alpha1) / std::max(n_alpha - 1, (int64_t)1);
+
+  const double *nx = node_x.data_ptr<double>();
+  const double *ny = node_y.data_ptr<double>();
+  const int64_t *elt = elements.data_ptr<int64_t>();
+  const int64_t *adj = adjacency.data_ptr<int64_t>();
+  const C *nk = reinterpret_cast<const C*>(node_k.data_ptr());
+  const C *nps = reinterpret_cast<const C*>(node_phi_s.data_ptr());
+  const C *npr = reinterpret_cast<const C*>(node_phi_r.data_ptr());
+  const int64_t *nM = node_M.data_ptr<int64_t>();
+  const double *rc = rad_cos.data_ptr<double>();
+  const double *rs = rad_sin.data_ptr<double>();
+
+  auto P_t = torch::zeros({n_theta, n_r}, torch::dtype(torch::kComplexDouble));
+  C *P = reinterpret_cast<C*>(P_t.data_ptr());
+
+  // Helper: get element info for a mode
+  auto get_elt = [&](int64_t ie, int64_t mode,
+      double &x1, double &y1, double &x2, double &y2, double &x3, double &y3,
+      double &D12, double &D13, double &D23, double &delta,
+      int64_t &s1, int64_t &s2, int64_t &s3, int64_t &Mprop,
+      C &cx_out, C &cy_out) -> bool {
+    s1 = elt[ie*3]; s2 = elt[ie*3+1]; s3 = elt[ie*3+2];
+    Mprop = std::min({nM[s1], nM[s2], nM[s3], M_max});
+    if (mode >= Mprop) return false;
+    x1 = nx[s1]; y1 = ny[s1]; x2 = nx[s2]; y2 = ny[s2]; x3 = nx[s3]; y3 = ny[s3];
+    D12 = x1*y2 - y1*x2; D13 = x1*y3 - y1*x3; D23 = x2*y3 - y2*x3;
+    delta = D23 - D13 + D12;
+    if (std::abs(delta) < 1e-30) return false;
+    C k1 = nk[s1*M_max+mode], k2 = nk[s2*M_max+mode], k3 = nk[s3*M_max+mode];
+    double A1x=-y3+y2, A2x=y3-y1, A3x=-y2+y1;
+    double A1y=x3-x2, A2y=-x3+x1, A3y=x2-x1;
+    cx_out = (A1x/k1 + A2x/k2 + A3x/k3) / delta;
+    cy_out = (A1y/k1 + A2y/k2 + A3y/k3) / delta;
+    return true;
+  };
+
+  for (int64_t ia = 0; ia < n_alpha; ++ia) {
+    double alpha = alpha1 + ia * d_alpha;
+    double tsx = std::cos(alpha), tsy = std::sin(alpha);
+
+    for (int64_t mode = 0; mode < M_limit; ++mode) {
+      double x1,y1,x2,y2,x3,y3,D12,D13,D23,delta;
+      int64_t s1,s2,s3,Mprop;
+      C cx, cy;
+      int64_t ie = ie_src;
+
+      if (!get_elt(ie, mode, x1,y1,x2,y2,x3,y3,D12,D13,D23,delta,s1,s2,s3,Mprop,cx,cy))
+        continue;
+      if (mode >= Mprop) continue;
+
+      // Barycentric at source
+      double DB1=sx*y1-sy*x1, DB2=sx*y2-sy*x2, DB3=sx*y3-sy*x3;
+      double A1=(D23-DB3+DB2)/delta, A2=(DB3-D13-DB1)/delta, A3=(-DB2+DB1+D12)/delta;
+
+      C cA = A1/nk[s1*M_max+mode] + A2/nk[s2*M_max+mode] + A3/nk[s3*M_max+mode];
+      C phi_src = A1*nps[s1*M_max+mode] + A2*nps[s2*M_max+mode] + A3*nps[s3*M_max+mode];
+
+      double Hwidth;
+      if (beam_type == 'F') Hwidth = 2.0 / (std::real(C(1.0)/cA) * d_alpha);
+      else Hwidth = std::sqrt(2.0 * std::real(cA) * r_max);
+      double EpsOpt = 0.5 * Hwidth * Hwidth;
+      C eps = C(0.0, eps_mult * EpsOpt);
+      C cnst = phi_src * std::sqrt(eps / cA) * d_alpha;
+
+      double xA=sx, yA=sy;
+      double xiA=tsx/std::real(cA), etaA=tsy/std::real(cA);
+      C pA(1.0), qA=eps, tauA(0.0);
+      int KMAHA = 1;
+      C phiA = A1*npr[s1*M_max+mode] + A2*npr[s2*M_max+mode] + A3*npr[s3*M_max+mode];
+      bool exited = false;
+
+      for (int64_t istep = 0; istep < n_steps; ++istep) {
+        double cA_r = std::real(cA);
+        double xB = xA + step_size * cA_r * xiA;
+        double yB = yA + step_size * cA_r * etaA;
+        double xiB = xiA - step_size * std::real(cx / (cA*cA));
+        double etaB = etaA - step_size * std::real(cy / (cA*cA));
+        C pB = pA;
+        C qB = qA + step_size * cA_r * pA;
+        C tauB = tauA + step_size / cA;
+
+        int KMAHB = KMAHA;
+        if (std::real(qB) < 0.0) {
+          if ((std::imag(qA) < 0 && std::imag(qB) >= 0) ||
+              (std::imag(qA) > 0 && std::imag(qB) <= 0)) KMAHB = -KMAHA;
+        }
+
+        C cB = cA, phiB = phiA;
+        if (!exited) {
+          DB1=xB*y1-yB*x1; DB2=xB*y2-yB*x2; DB3=xB*y3-yB*x3;
+          A1=(D23-DB3+DB2)/delta; A2=(DB3-D13-DB1)/delta; A3=(-DB2+DB1+D12)/delta;
+
+          for (int cross = 0; cross < 100 && (A1<0||A2<0||A3<0); ++cross) {
+            int side = (A3<0) ? 0 : (A1<0 ? 1 : 2);
+            int64_t next = adj[ie*3+side];
+            if (next < 0) { exited = true; cx=C(0); cy=C(0); break; }
+            ie = next;
+            if (!get_elt(ie,mode,x1,y1,x2,y2,x3,y3,D12,D13,D23,delta,s1,s2,s3,Mprop,cx,cy))
+              { exited = true; break; }
+            if (mode >= Mprop) { exited = true; break; }
+            DB1=xB*y1-yB*x1; DB2=xB*y2-yB*x2; DB3=xB*y3-yB*x3;
+            A1=(D23-DB3+DB2)/delta; A2=(DB3-D13-DB1)/delta; A3=(-DB2+DB1+D12)/delta;
+          }
+          if (!exited) {
+            cB = A1/nk[s1*M_max+mode]+A2/nk[s2*M_max+mode]+A3/nk[s3*M_max+mode];
+            phiB = A1*npr[s1*M_max+mode]+A2*npr[s2*M_max+mode]+A3*npr[s3*M_max+mode];
+          }
+        }
+
+        // Influence on receivers
+        double _xA=xA-sx, _yA=yA-sy, _xB=xB-sx, _yB=yB-sy;
+        for (int64_t it = 0; it < n_theta; ++it) {
+          double rv1=rc[it], rv2=rs[it];
+          double dA = rv1*xiA + rv2*etaA;
+          double dB = rv1*xiB + rv2*etaB;
+          if (std::abs(dA)<1e-30 || std::abs(dB)<1e-30 || dA*dB<=0) continue;
+          double rA = (_yA*etaA+_xA*xiA)/dA;
+          double rB = (_yB*etaB+_xB*xiB)/dB;
+          int64_t ir1 = std::max(std::min((int64_t)((rA-r_min)/delta_r)+1, n_r), (int64_t)0);
+          int64_t ir2 = std::max(std::min((int64_t)((rB-r_min)/delta_r)+1, n_r), (int64_t)1);
+          if (ir2 <= ir1) continue;
+          double nA_v = (_xA*rv2-_yA*rv1)/(cA_r*dA);
+          double nB_v = (_xB*rv2-_yB*rv1)/(std::real(cB)*dB);
+          double rBA = rB - rA;
+          if (std::abs(rBA) < 1e-30) continue;
+          for (int64_t ir = ir1+1; ir <= std::min(ir2, n_r); ++ir) {
+            double W = (r_min + (ir-1)*delta_r - rA) / rBA;
+            C pM = pA + W*(pB-pA);
+            C qM = qA + W*(qB-qA);
+            double n2 = (nA_v + W*(nB_v-nA_v));
+            n2 = n2*n2;
+            if (qM != C(0) && -0.5*std::imag(pM/qM)*n2 < BEAM_WINDOW) {
+              C cM = cA + W*(cB-cA);
+              C tM = tauA + W*(tauB-tauA);
+              C phM = phiA + W*(phiB-phiA);
+              int km = KMAHA;
+              if (std::real(qM)<0) {
+                if ((std::imag(qA)<0 && std::imag(qM)>=0)||(std::imag(qA)>0 && std::imag(qM)<=0))
+                  km = -km;
+              }
+              C contrib = cnst * phM * std::sqrt(cM/qM) * std::exp(C(0,-1)*(tM + C(0.5)*pM/qM*n2));
+              if (km < 0) contrib = -contrib;
+              P[it*n_r + ir-1] += contrib;
+            }
+          }
+        }
+
+        xA=xB; yA=yB; xiA=xiB; etaA=etaB;
+        pA=pB; qA=qB; tauA=tauB; cA=cB;
+        KMAHA=KMAHB; phiA=phiB;
+      }
+    }
+  }
+  return P_t;
+}
+
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -2249,4 +2449,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("refine_roots", &refine_roots_cpp);
   m.def("elastic_solve1", &elastic_solve1_cpp);
   m.def("krakenc_fused", &krakenc_fused_cpp);
+  m.def("field3d_gbt", &field3d_gbt_cpp);
 }
