@@ -671,7 +671,7 @@ class TridiagEigvecVaryingBatchAdjointFn(torch.autograd.Function):
             phi_batch, d_batch, e_batch = ctx.saved_tensors
             sigmas_saved = None
         M, N = phi_batch.shape
-        reg = max(ctx.eps * ctx.eps, 1e-14)
+        base_reg = max(ctx.eps * ctx.eps, 1e-14)
 
         # Batched: compute all M projections and tridiag solves together
         if phi_batch.is_complex():
@@ -700,12 +700,14 @@ class TridiagEigvecVaryingBatchAdjointFn(torch.autograd.Function):
         g_orth = grad_phi_batch - coeffs * phi_hat  # [M, N]
 
         # Batched tridiag solve: (T - sigma*I + reg) lam = g_orth
-        shifted_d = d_batch - sigmas.to(d_batch.dtype).unsqueeze(1) + reg  # [M, N]
-        if e_batch.dim() == 2 and M > 1 and torch.allclose(e_batch[0], e_batch[1]):
-            # Shared off-diagonal — use batched C++ solve
-            lam = solve_tridiag_batch(e_batch[0], shifted_d, e_batch[0], g_orth)
+        # Solve (T - sigma + reg) lambda = g_orth
+        reg = base_reg
+        shifted_d = d_batch - sigmas.to(d_batch.dtype).unsqueeze(1) + reg
+
+        e_shared = e_batch[0] if (e_batch.dim() == 2 and M > 1 and torch.allclose(e_batch[0], e_batch[1])) else None
+        if e_shared is not None:
+            lam = solve_tridiag_batch(e_shared, shifted_d, e_shared, g_orth)
         else:
-            # Per-mode off-diagonals — solve individually
             lam = torch.zeros_like(g_orth)
             for m in range(M):
                 e_m = e_batch[m] if e_batch.dim() == 2 else e_batch

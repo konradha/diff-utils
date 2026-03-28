@@ -2532,6 +2532,13 @@ std::tuple<torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp(
       int64_t cur_s1=s1, cur_s2=s2, cur_s3=s3;
       double cur_A1=A1, cur_A2=A2, cur_A3=A3;
       bool exited = false;
+      int64_t n_actual_steps = 0;
+
+      // Per-step storage for ODE adjoint
+      std::vector<C> step_cA(n_steps);
+      std::vector<int64_t> step_s1(n_steps), step_s2(n_steps), step_s3(n_steps);
+      std::vector<double> step_A1(n_steps), step_A2(n_steps), step_A3(n_steps);
+      std::vector<C> step_grad_tau(n_steps, C(0));
 
       for (int64_t istep = 0; istep < n_steps; ++istep) {
         double cA_r = std::real(cA);
@@ -2576,7 +2583,12 @@ std::tuple<torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp(
           }
         }
 
-        // Backward influence: same loop as forward but accumulate gradients
+        // Save per-step state for ODE adjoint
+        step_cA.push_back(cA);
+        step_s1.push_back(cur_s1); step_s2.push_back(cur_s2); step_s3.push_back(cur_s3);
+        step_A1.push_back(cur_A1); step_A2.push_back(cur_A2); step_A3.push_back(cur_A3);
+
+        // Compute per-hit gradients for phi (direct) and tau (for ODE adjoint)
         double _xA=xA-sx, _yA=yA-sy, _xB=xB-sx, _yB=yB-sy;
         for (int64_t it = 0; it < n_theta; ++it) {
           double rv1=rc[it], rv2=rs[it];
@@ -2609,28 +2621,33 @@ std::tuple<torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp(
               C contrib = cnst * phM * std::sqrt(cM/qM) * std::exp(C(0,-1)*(tM + C(0.5)*pM/qM*n2));
               if (km < 0) contrib = -contrib;
 
-              // grad_P contribution
               C gp = gP[it*n_r + ir-1];
               if (std::abs(gp) < 1e-30) continue;
 
-              // d(contrib)/d(phiB) = W * contrib/phM (phi enters linearly)
+              // phi gradient (direct, correct)
               if (std::abs(phM) > 1e-30) {
                 C dcdphi = W * contrib / phM;
-                C grad_phi_contrib = gp * dcdphi;
-                // Distribute to nodes at B via barycentric
-                gpr[B_s1*M_max+mode] += std::conj(grad_phi_contrib) * C(B_A1);
-                gpr[B_s2*M_max+mode] += std::conj(grad_phi_contrib) * C(B_A2);
-                gpr[B_s3*M_max+mode] += std::conj(grad_phi_contrib) * C(B_A3);
+                C g_phi = gp * dcdphi;
+                gpr[B_s1*M_max+mode] += g_phi * C(B_A1);
+                gpr[B_s2*M_max+mode] += g_phi * C(B_A2);
+                gpr[B_s3*M_max+mode] += g_phi * C(B_A3);
               }
 
-              // d(contrib)/d(cB) → d(cB)/d(ki) = -Ai/ki²
+              // Phase gradient: d(contrib)/d(tauA) = -i*(1-W)*contrib, d(contrib)/d(tauB) = -i*W*contrib
+              // Accumulate into per-step grad_tau for ODE adjoint
+              C grad_tau_hit = gp * C(0,-1) * contrib;
+              step_grad_tau[istep] += (1.0 - W) * grad_tau_hit;  // tauA contribution
+              if (istep + 1 < n_steps)
+                step_grad_tau[istep + 1] += W * grad_tau_hit;  // tauB → next step's tauA
+
+              // Direct c gradient from sqrt(c/q) term (local, not accumulated)
               if (std::abs(cM) > 1e-30) {
-                C dcdc = W * contrib * C(0.5) / cM;  // from sqrt(cM/qM) term
-                C grad_c_contrib = gp * dcdc;
+                C dcdc = W * contrib * C(0.5) / cM;
+                C g_c = gp * dcdc;
                 C k1 = nk[B_s1*M_max+mode], k2 = nk[B_s2*M_max+mode], k3 = nk[B_s3*M_max+mode];
-                gk[B_s1*M_max+mode] += std::conj(grad_c_contrib) * C(-B_A1) / (k1*k1);
-                gk[B_s2*M_max+mode] += std::conj(grad_c_contrib) * C(-B_A2) / (k2*k2);
-                gk[B_s3*M_max+mode] += std::conj(grad_c_contrib) * C(-B_A3) / (k3*k3);
+                gk[B_s1*M_max+mode] += g_c * C(-B_A1) / (k1*k1);
+                gk[B_s2*M_max+mode] += g_c * C(-B_A2) / (k2*k2);
+                gk[B_s3*M_max+mode] += g_c * C(-B_A3) / (k3*k3);
               }
             }
           }
@@ -2641,6 +2658,27 @@ std::tuple<torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp(
         KMAHA=KMAHB; phiA=phiB;
         cur_s1=B_s1; cur_s2=B_s2; cur_s3=B_s3;
         cur_A1=B_A1; cur_A2=B_A2; cur_A3=B_A3;
+        n_actual_steps = istep + 1;
+      }
+
+      // ODE adjoint: sweep backward through steps, propagate grad_tau → grad_c → grad_k
+      // tauB = tauA + step/cA → d(tauB)/d(cA) = -step/cA²
+      // Backward: grad_cA += grad_tauB * (-step/cA²)
+      //           grad_tauA += grad_tauB  (tau accumulates)
+      C adj_tau(0);
+      for (int64_t istep = n_actual_steps - 1; istep >= 0; --istep) {
+        adj_tau += step_grad_tau[istep];
+        C cA_step = step_cA[istep];
+        // d(tauB)/d(cA) = -step/cA² → grad_cA += adj_tau * (-step/cA²)
+        if (std::abs(cA_step) < 1e-30) continue;
+        C grad_c_phase = adj_tau * C(-step_size) / (cA_step * cA_step);
+        // Distribute to node k via d(cA)/d(ki) = -Ai/ki²
+        int64_t si1 = step_s1[istep], si2 = step_s2[istep], si3 = step_s3[istep];
+        double ai1 = step_A1[istep], ai2 = step_A2[istep], ai3 = step_A3[istep];
+        C k1 = nk[si1*M_max+mode], k2 = nk[si2*M_max+mode], k3 = nk[si3*M_max+mode];
+        gk[si1*M_max+mode] += grad_c_phase * C(-ai1) / (k1*k1);
+        gk[si2*M_max+mode] += grad_c_phase * C(-ai2) / (k2*k2);
+        gk[si3*M_max+mode] += grad_c_phase * C(-ai3) / (k3*k3);
       }
     }
   }
