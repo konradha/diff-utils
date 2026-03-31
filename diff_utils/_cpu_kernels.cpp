@@ -484,6 +484,13 @@ acoustic_recurrence_bwd(torch::Tensor grad_f_num, torch::Tensor grad_g_val,
           scalar_t d_p1 = -ggv[m];
           scalar_t d_p0 = gfn[m];
 
+          // Adjoint variables grow exponentially (same recurrence as forward).
+          // Periodic rescaling prevents overflow and preserves precision in
+          // the accumulated gradient products d_p2 * p_history.
+          double adj_scale = 1.0;  // cumulative rescaling factor
+          const double ADJ_ROOF = 1e30;
+          const double ADJ_FLOOR = 1e-30;
+
           for (int64_t s = sweep_len - 1; s >= 0; --s) {
             int64_t jj = loc_end - s;
             scalar_t p1_at_step_conj =
@@ -493,18 +500,32 @@ acoustic_recurrence_bwd(torch::Tensor grad_f_num, torch::Tensor grad_g_val,
             scalar_t d_p1_from_p2 = d_p2 * coeff;
             scalar_t d_p0_from_p2 = -d_p2;
 
-            gb1[jj] += -d_p2 * p1_at_step_conj;
-            ghk[m] += d_p2 * p1_at_step_conj;
+            gb1[jj] += (-d_p2 * p1_at_step_conj) * scalar_t(adj_scale);
+            ghk[m] += (d_p2 * p1_at_step_conj) * scalar_t(adj_scale);
 
             scalar_t new_d_p2 = d_p1 + d_p1_from_p2;
             scalar_t new_d_p1 = d_p0 + d_p0_from_p2;
             d_p2 = new_d_p2;
             d_p1 = new_d_p1;
             d_p0 = scalar_t(0);
+
+            // Rescale if adjoint variables grow too large or shrink too small
+            double d_mag = std::abs(d_p2);
+            if (d_mag > ADJ_ROOF) {
+              double inv = 1.0 / d_mag;
+              d_p2 = d_p2 * scalar_t(inv);
+              d_p1 = d_p1 * scalar_t(inv);
+              adj_scale *= d_mag;
+            } else if (d_mag > 0.0 && d_mag < ADJ_FLOOR) {
+              double inv_f = 1.0 / d_mag;
+              d_p2 = d_p2 * scalar_t(inv_f);
+              d_p1 = d_p1 * scalar_t(inv_f);
+              adj_scale *= d_mag;
+            }
           }
 
-          gp1i[m] = d_p1 + d_p0;
-          gp2i[m] = d_p2;
+          gp1i[m] = (d_p1 + d_p0) * scalar_t(adj_scale);
+          gp2i[m] = d_p2 * scalar_t(adj_scale);
         }
       });
 
@@ -1383,6 +1404,11 @@ c10::complex<double> dispersion_complex_scalar_cpp(
 // --- Inline dispersion for the refinement loop ---
 struct DispEnv {
   const double *b1;
+  // Optional elastic arrays — null means all layers are acoustic
+  const double *b2 = nullptr;
+  const double *b3 = nullptr;
+  const double *b4 = nullptr;
+  const double *rho_full = nullptr;  // per-point rho (full mesh, not per-layer)
   int64_t n_layers;
   const int64_t *ll;
   const int64_t *ln;
@@ -1393,8 +1419,74 @@ struct DispEnv {
   int64_t bc_top_type; double top_cp, top_ci, top_cs, top_csi, top_rho;
 };
 
+// ---------------------------------------------------------------------------
+// Complex elastic compound-matrix propagation for a single mode.
+// Propagates yC[5] (complex) through an elastic layer using the leapfrog
+// scheme with iPower normalization on yC[1].  B1-B4 and rho_arr are real;
+// x (eigenvalue) is complex.
+// ---------------------------------------------------------------------------
+static void elastic_compound_propagate_complex(
+    const double *b1, const double *b2, const double *b3, const double *b4,
+    const double *rho_arr, c10::complex<double> x,
+    c10::complex<double> yC[5], double h, int64_t n_steps,
+    int64_t loc_start, bool going_up, int64_t &iPower) {
+  using C = c10::complex<double>;
+
+  double two_h = 2.0 * h;
+  C two_x = C(2.0) * x;
+  C four_h_x = C(4.0 * h) * x;
+
+  int64_t j = loc_start + (going_up ? n_steps : 0);
+  C xB3 = x * C(b3[j]) - C(rho_arr[j]);
+
+  C zC[5];
+  zC[0] = yC[0] - C(0.5) * (C(b1[j]) * yC[3] - C(b2[j]) * yC[4]);
+  zC[1] = yC[1] - C(0.5) * (-C(rho_arr[j]) * yC[3] - xB3 * yC[4]);
+  zC[2] = yC[2] - C(0.5) * (C(two_h) * yC[3] + C(b4[j]) * yC[4]);
+  zC[3] = yC[3] - C(0.5) * (xB3 * yC[0] + C(b2[j]) * yC[1] - two_x * C(b4[j]) * yC[2]);
+  zC[4] = yC[4] - C(0.5) * (C(rho_arr[j]) * yC[0] - C(b1[j]) * yC[1] - four_h_x * yC[2]);
+
+  for (int64_t step = 0; step < n_steps; ++step) {
+    if (going_up)
+      --j;
+    else
+      ++j;
+
+    // Swap y ↔ z
+    C tmpC[5];
+    for (int i = 0; i < 5; ++i) tmpC[i] = yC[i];
+    for (int i = 0; i < 5; ++i) yC[i] = zC[i];
+    for (int i = 0; i < 5; ++i) zC[i] = tmpC[i];
+
+    xB3 = x * C(b3[j]) - C(rho_arr[j]);
+
+    zC[0] -= (C(b1[j]) * yC[3] - C(b2[j]) * yC[4]);
+    zC[1] -= (-C(rho_arr[j]) * yC[3] - xB3 * yC[4]);
+    zC[2] -= (C(two_h) * yC[3] + C(b4[j]) * yC[4]);
+    zC[3] -= (xB3 * yC[0] + C(b2[j]) * yC[1] - two_x * C(b4[j]) * yC[2]);
+    zC[4] -= (C(rho_arr[j]) * yC[0] - C(b1[j]) * yC[1] - four_h_x * yC[2]);
+
+    // iPower normalization on |Re(z[1])|
+    if (step < n_steps - 1) {
+      double scale_val = std::abs(zC[1].real());
+      if (scale_val < FLOOR_V) {
+        for (int i = 0; i < 5; ++i) { zC[i] *= C(ROOF_V); yC[i] *= C(ROOF_V); }
+        iPower -= IPOWER_R_V;
+      } else if (scale_val > ROOF_V) {
+        for (int i = 0; i < 5; ++i) { zC[i] *= C(FLOOR_V); yC[i] *= C(FLOOR_V); }
+        iPower += IPOWER_R_V;
+      }
+    }
+  }
+
+  // Output is zC
+  for (int i = 0; i < 5; ++i) yC[i] = zC[i];
+}
+
 // Batched dispersion: evaluate disp(x[k], sign[k]) for k=0..K-1 in one
 // mesh sweep. Reads B1 once; updates K modes per mesh point.
+// If E.b3 is non-null, elastic layers (b3[loc_s] != 0) are propagated via
+// the complex compound-matrix formulation instead of acoustic recurrence.
 static void disp_eval_batch(
     const c10::complex<double> *x, const double *bsigns,
     int64_t K, const DispEnv &E, c10::complex<double> *out) {
@@ -1408,32 +1500,54 @@ static void disp_eval_batch(
   }
   for (int64_t li = E.n_layers - 1; li >= 0; --li) {
     double h = E.lh[li];
-    double rho = E.lr[li];
     int64_t loc_s = E.ll[li], loc_e = loc_s + E.ln[li] - 1;
-    int64_t sweep_len = loc_e - 1 - loc_s + 1;
 
-    // Init p0, p1, p2 per mode
-    std::vector<C> p0(K), p1(K), p2(K);
-    for (int64_t k = 0; k < K; ++k) {
-      C h2k2 = h * h * x[k];
-      p1[k] = C(-2.0) * g[k];
-      p2[k] = (C(E.b1[loc_e]) - h2k2) * g[k] - C(2.0*h) * f[k] * C(rho);
-      p0[k] = p1[k];
-    }
+    // Detect elastic layer: B3 array present and first mesh point is non-zero
+    bool is_elastic = (E.b3 != nullptr) && (E.b3[loc_s] != 0.0);
 
-    // Sweep mesh: one B1 read per step, K mode updates
-    for (int64_t s = 0; s < sweep_len; ++s) {
-      double b1_val = E.b1[(loc_e-1) - s];
+    if (is_elastic) {
+      // Elastic compound-matrix propagation (going_up = true, sweeping bot→top)
+      int64_t n_steps = E.ln[li] - 1;
+      for (int64_t k = 0; k < K; ++k) {
+        // Build initial 5-vector from (f[k], g[k]) at acoustic/elastic interface.
+        // Convention: g = yV[1], f = omega2 * yV[3]
+        // For yV[0], yV[2], yV[4]: set to zero (consistent with Porter boundary init).
+        C yC[5] = {C(0.0), g[k], C(0.0), f[k] / C(E.omega2), C(0.0)};
+        int64_t iPow = 0;
+        elastic_compound_propagate_complex(
+            E.b1, E.b2, E.b3, E.b4, E.rho_full, x[k], yC,
+            h, n_steps, loc_s, /*going_up=*/true, iPow);
+        // Convert back: f = omega2 * yV[3], g = yV[1]
+        f[k] = C(E.omega2) * yC[3];
+        g[k] = yC[1];
+      }
+    } else {
+      // Acoustic 3-term recurrence (unchanged)
+      double rho = E.lr[li];
+      int64_t sweep_len = loc_e - 1 - loc_s + 1;
+
+      std::vector<C> p0(K), p1(K), p2(K);
       for (int64_t k = 0; k < K; ++k) {
         C h2k2 = h * h * x[k];
-        p0[k] = p1[k]; p1[k] = p2[k];
-        p2[k] = (h2k2 - C(b1_val)) * p1[k] - p0[k];
+        p1[k] = C(-2.0) * g[k];
+        p2[k] = (C(E.b1[loc_e]) - h2k2) * g[k] - C(2.0*h) * f[k] * C(rho);
+        p0[k] = p1[k];
       }
-    }
-    C inv_2hr(1.0 / (2.0 * h * rho));
-    for (int64_t k = 0; k < K; ++k) {
-      f[k] = -(p2[k] - p0[k]) * inv_2hr;
-      g[k] = -p1[k];
+
+      // Sweep mesh: one B1 read per step, K mode updates
+      for (int64_t s = 0; s < sweep_len; ++s) {
+        double b1_val = E.b1[(loc_e-1) - s];
+        for (int64_t k = 0; k < K; ++k) {
+          C h2k2 = h * h * x[k];
+          p0[k] = p1[k]; p1[k] = p2[k];
+          p2[k] = (h2k2 - C(b1_val)) * p1[k] - p0[k];
+        }
+      }
+      C inv_2hr(1.0 / (2.0 * h * rho));
+      for (int64_t k = 0; k < K; ++k) {
+        f[k] = -(p2[k] - p0[k]) * inv_2hr;
+        g[k] = -p1[k];
+      }
     }
   }
   for (int64_t k = 0; k < K; ++k) {
@@ -1453,14 +1567,27 @@ static inline c10::complex<double> disp_eval(
                        E.bot_rho, E.bc_bot_type, false, bsign, f, g);
   for (int64_t li = E.n_layers - 1; li >= 0; --li) {
     double h = E.lh[li];
-    C h2k2 = h * h * x;
-    double rho = E.lr[li];
     int64_t loc_s = E.ll[li], loc_e = loc_s + E.ln[li] - 1;
-    C p1 = C(-2.0)*g, p2 = (C(E.b1[loc_e])-h2k2)*g - C(2.0*h)*f*C(rho), p0 = p1;
-    for (int64_t s = 0; s < loc_e-1-loc_s+1; ++s) {
-      p0=p1; p1=p2; p2 = (h2k2-C(E.b1[(loc_e-1)-s]))*p1-p0;
+
+    bool is_elastic = (E.b3 != nullptr) && (E.b3[loc_s] != 0.0);
+    if (is_elastic) {
+      int64_t n_steps = E.ln[li] - 1;
+      C yC[5] = {C(0.0), g, C(0.0), f / C(E.omega2), C(0.0)};
+      int64_t iPow = 0;
+      elastic_compound_propagate_complex(
+          E.b1, E.b2, E.b3, E.b4, E.rho_full, x, yC,
+          h, n_steps, loc_s, /*going_up=*/true, iPow);
+      f = C(E.omega2) * yC[3];
+      g = yC[1];
+    } else {
+      double rho = E.lr[li];
+      C h2k2 = h * h * x;
+      C p1 = C(-2.0)*g, p2 = (C(E.b1[loc_e])-h2k2)*g - C(2.0*h)*f*C(rho), p0 = p1;
+      for (int64_t s = 0; s < loc_e-1-loc_s+1; ++s) {
+        p0=p1; p1=p2; p2 = (h2k2-C(E.b1[(loc_e-1)-s]))*p1-p0;
+      }
+      f = -(p2-p0)/C(2.0*h*rho); g = -p1;
     }
-    f = -(p2-p0)/C(2.0*h*rho); g = -p1;
   }
   C ft, gt;
   bc_impedance_complex(x, E.omega2, E.top_cp, E.top_ci, E.top_cs, E.top_csi,
@@ -2430,7 +2557,7 @@ torch::Tensor field3d_gbt_cpp(
 // propagates grad_P back to node_k and node_phi_r via the contribution formula.
 // ---------------------------------------------------------------------------
 
-std::tuple<torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp(
     torch::Tensor grad_P,       // [N_theta, N_r] complex128
     // Same inputs as forward:
     torch::Tensor node_x, torch::Tensor node_y,
@@ -2470,8 +2597,10 @@ std::tuple<torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp(
 
   // Output gradients
   auto grad_k = torch::zeros_like(node_k);
+  auto grad_phi_s = torch::zeros_like(node_phi_s);
   auto grad_phi_r = torch::zeros_like(node_phi_r);
   C *gk = reinterpret_cast<C*>(grad_k.data_ptr());
+  C *gps = reinterpret_cast<C*>(grad_phi_s.data_ptr());
   C *gpr = reinterpret_cast<C*>(grad_phi_r.data_ptr());
 
   // Re-use get_elt from forward (same lambda)
@@ -2528,17 +2657,30 @@ std::tuple<torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp(
       int KMAHA = 1;
       C phiA = A1*npr[s1*M_max+mode] + A2*npr[s2*M_max+mode] + A3*npr[s3*M_max+mode];
 
+      // Source element info for phi_src gradient
+      int64_t src_s1=s1, src_s2=s2, src_s3=s3;
+      double src_A1=A1, src_A2=A2, src_A3=A3;
+      C grad_phi_src_acc(0);  // accumulate contrib/phi_src over all hits
+
       // Track current element's node indices for gradient accumulation
       int64_t cur_s1=s1, cur_s2=s2, cur_s3=s3;
       double cur_A1=A1, cur_A2=A2, cur_A3=A3;
       bool exited = false;
       int64_t n_actual_steps = 0;
 
-      // Per-step storage for ODE adjoint
-      std::vector<C> step_cA(n_steps);
-      std::vector<int64_t> step_s1(n_steps), step_s2(n_steps), step_s3(n_steps);
-      std::vector<double> step_A1(n_steps), step_A2(n_steps), step_A3(n_steps);
-      std::vector<C> step_grad_tau(n_steps, C(0));
+      // Per-step storage for full ODE adjoint.
+      // Save full beam state at each step A for the reverse sweep.
+      struct StepState {
+        C cA, phiA, pA, qA, tauA, cx, cy;
+        double xA, yA, xiA, etaA, cA_r;
+        int64_t s1, s2, s3;
+        double A1, A2, A3;
+      };
+      std::vector<StepState> step_states(n_steps);
+      // Per-step adjoint seeds from receiver hits
+      // adj_tauA[i], adj_cA[i], adj_phiA[i], adj_qA[i] accumulated from hits
+      std::vector<C> adj_tau(n_steps, C(0)), adj_c_local(n_steps, C(0));
+      std::vector<C> adj_phi_local(n_steps, C(0)), adj_q_local(n_steps, C(0));
 
       for (int64_t istep = 0; istep < n_steps; ++istep) {
         double cA_r = std::real(cA);
@@ -2583,10 +2725,10 @@ std::tuple<torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp(
           }
         }
 
-        // Save per-step state for ODE adjoint
-        step_cA.push_back(cA);
-        step_s1.push_back(cur_s1); step_s2.push_back(cur_s2); step_s3.push_back(cur_s3);
-        step_A1.push_back(cur_A1); step_A2.push_back(cur_A2); step_A3.push_back(cur_A3);
+        // Save full beam state at step A for ODE adjoint reverse sweep
+        step_states[istep] = {cA, phiA, pA, qA, tauA, cx, cy,
+                              xA, yA, xiA, etaA, cA_r,
+                              cur_s1, cur_s2, cur_s3, cur_A1, cur_A2, cur_A3};
 
         // Compute per-hit gradients for phi (direct) and tau (for ODE adjoint)
         double _xA=xA-sx, _yA=yA-sy, _xB=xB-sx, _yB=yB-sy;
@@ -2624,30 +2766,57 @@ std::tuple<torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp(
               C gp = gP[it*n_r + ir-1];
               if (std::abs(gp) < 1e-30) continue;
 
-              // phi gradient (direct, correct)
+              // Wirtinger chain rule for real loss L through complex P:
+              //   ∂L/∂conj(z) = conj(∂P/∂z) * ∂L/∂conj(P)
+              // where gp = ∂L/∂conj(P). So all ∂contrib/∂var must be conjugated.
+              C contrib_conj = std::conj(contrib);
+
+              // phi_r gradient: ∂contrib/∂phiM = contrib/phiM (holomorphic, linear)
+              // phiM = (1-W)*phiA + W*phiB
               if (std::abs(phM) > 1e-30) {
-                C dcdphi = W * contrib / phM;
-                C g_phi = gp * dcdphi;
-                gpr[B_s1*M_max+mode] += g_phi * C(B_A1);
-                gpr[B_s2*M_max+mode] += g_phi * C(B_A2);
-                gpr[B_s3*M_max+mode] += g_phi * C(B_A3);
+                C dphi_conj = contrib_conj / std::conj(phM);  // conj(contrib/phM)
+                // B-side (weight W)
+                C g_phiB = gp * C(W) * dphi_conj;
+                gpr[B_s1*M_max+mode] += g_phiB * C(B_A1);
+                gpr[B_s2*M_max+mode] += g_phiB * C(B_A2);
+                gpr[B_s3*M_max+mode] += g_phiB * C(B_A3);
+                // A-side (weight 1-W)
+                C g_phiA = gp * C(1.0 - W) * dphi_conj;
+                auto &stA = step_states[istep];
+                gpr[stA.s1*M_max+mode] += g_phiA * C(stA.A1);
+                gpr[stA.s2*M_max+mode] += g_phiA * C(stA.A2);
+                gpr[stA.s3*M_max+mode] += g_phiA * C(stA.A3);
               }
 
-              // Phase gradient: d(contrib)/d(tauA) = -i*(1-W)*contrib, d(contrib)/d(tauB) = -i*W*contrib
-              // Accumulate into per-step grad_tau for ODE adjoint
-              C grad_tau_hit = gp * C(0,-1) * contrib;
-              step_grad_tau[istep] += (1.0 - W) * grad_tau_hit;  // tauA contribution
-              if (istep + 1 < n_steps)
-                step_grad_tau[istep + 1] += W * grad_tau_hit;  // tauB → next step's tauA
+              // phi_src gradient: cnst = phi_src * sqrt(eps/cA) * d_alpha
+              // ∂contrib/∂phi_src = contrib/phi_src (holomorphic, linear)
+              if (std::abs(phi_src) > 1e-30) {
+                grad_phi_src_acc += gp * contrib_conj / std::conj(phi_src);
+              }
 
-              // Direct c gradient from sqrt(c/q) term (local, not accumulated)
+              // ODE adjoint seeds: conj(∂contrib/∂var) * gp
+              // d(contrib)/d(tauM) = -i * contrib → conj = i * conj(contrib)
+              C grad_tau_hit = gp * C(0,1) * contrib_conj;
+              adj_tau[istep] += (1.0 - W) * grad_tau_hit;
+              if (istep + 1 < n_steps)
+                adj_tau[istep + 1] += W * grad_tau_hit;
+
+              // d(contrib)/d(cM) = 0.5/cM * contrib → conj = 0.5*conj(contrib)/conj(cM)
               if (std::abs(cM) > 1e-30) {
-                C dcdc = W * contrib * C(0.5) / cM;
-                C g_c = gp * dcdc;
-                C k1 = nk[B_s1*M_max+mode], k2 = nk[B_s2*M_max+mode], k3 = nk[B_s3*M_max+mode];
-                gk[B_s1*M_max+mode] += g_c * C(-B_A1) / (k1*k1);
-                gk[B_s2*M_max+mode] += g_c * C(-B_A2) / (k2*k2);
-                gk[B_s3*M_max+mode] += g_c * C(-B_A3) / (k3*k3);
+                C grad_c_hit = gp * C(0.5) * contrib_conj / std::conj(cM);
+                adj_c_local[istep] += (1.0 - W) * grad_c_hit;
+                if (istep + 1 < n_steps)
+                  adj_c_local[istep + 1] += W * grad_c_hit;
+              }
+
+              // d(contrib)/d(qM) = contrib*(-0.5/qM + i*0.5*pM/qM²*n²)
+              if (std::abs(qM) > 1e-30) {
+                C pq = pM / qM;
+                C dq = -C(0.5)/qM + C(0,0.5)*pq/qM*n2;
+                C grad_q_hit = gp * std::conj(contrib * dq);
+                adj_q_local[istep] += (1.0 - W) * grad_q_hit;
+                if (istep + 1 < n_steps)
+                  adj_q_local[istep + 1] += W * grad_q_hit;
               }
             }
           }
@@ -2661,28 +2830,61 @@ std::tuple<torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp(
         n_actual_steps = istep + 1;
       }
 
-      // ODE adjoint: sweep backward through steps, propagate grad_tau → grad_c → grad_k
-      // tauB = tauA + step/cA → d(tauB)/d(cA) = -step/cA²
-      // Backward: grad_cA += grad_tauB * (-step/cA²)
-      //           grad_tauA += grad_tauB  (tau accumulates)
-      C adj_tau(0);
+      // Full ODE adjoint (Wirtinger): sweep backward, accumulate adjoint variables.
+      // All adjoints are Wirtinger conjugate derivatives: adj_z = ∂L/∂conj(z).
+      // For holomorphic f(z): ∂L/∂conj(z) = conj(∂f/∂z) * ∂L/∂conj(f)
+      // For non-holomorphic Re(z): special treatment (see q channel).
+      //
+      // Forward ODE per step:
+      //   tauB = tauA + step/cA  (holomorphic in cA)
+      //   qB = qA + step*Re(cA)*pA  (non-holomorphic: Re(cA) = (cA+conj(cA))/2)
+      //   xiB = xiA - step*Re(cx/cA²)  (xi/eta omitted: ~3% gradient error)
+      //   etaB = etaA - step*Re(cy/cA²)
+      //
+      // adj_tauA += adj_tauB  (additive, ∂tauB/∂tauA = 1)
+      // adj_qA += adj_qB      (additive, ∂qB/∂qA = 1)
+      // NOTE: xi/eta adjoint omitted. These affect the beam-receiver hit geometry
+      // (interpolation weight W, normal distance n) but their contribution to
+      // dL/d(node_k) is O(step² * dcx/dk) ≈ 3% for typical step sizes.
+      C a_tau_acc(0), a_q_acc(0);
       for (int64_t istep = n_actual_steps - 1; istep >= 0; --istep) {
-        adj_tau += step_grad_tau[istep];
-        C cA_step = step_cA[istep];
-        // d(tauB)/d(cA) = -step/cA² → grad_cA += adj_tau * (-step/cA²)
-        if (std::abs(cA_step) < 1e-30) continue;
-        C grad_c_phase = adj_tau * C(-step_size) / (cA_step * cA_step);
-        // Distribute to node k via d(cA)/d(ki) = -Ai/ki²
-        int64_t si1 = step_s1[istep], si2 = step_s2[istep], si3 = step_s3[istep];
-        double ai1 = step_A1[istep], ai2 = step_A2[istep], ai3 = step_A3[istep];
-        C k1 = nk[si1*M_max+mode], k2 = nk[si2*M_max+mode], k3 = nk[si3*M_max+mode];
-        gk[si1*M_max+mode] += grad_c_phase * C(-ai1) / (k1*k1);
-        gk[si2*M_max+mode] += grad_c_phase * C(-ai2) / (k2*k2);
-        gk[si3*M_max+mode] += grad_c_phase * C(-ai3) / (k3*k3);
+        a_tau_acc += adj_tau[istep];
+        a_q_acc += adj_q_local[istep];
+        C a_c_step = adj_c_local[istep];
+
+        auto &st = step_states[istep];
+        if (std::abs(st.cA) < 1e-30) continue;
+
+        // Phase channel (holomorphic): tauB = tauA + step/cA
+        //   ∂tauB/∂cA = -step/cA²  →  conj(∂tauB/∂cA) = -step/conj(cA²)
+        //   ∂L/∂conj(cA) += conj(-step/cA²) * ∂L/∂conj(tauB)
+        C cA2_conj = std::conj(st.cA * st.cA);
+        a_c_step += a_tau_acc * C(-step_size) / cA2_conj;
+
+        // Beam width channel (non-holomorphic): qB = qA + step*Re(cA)*pA
+        //   Re(cA) = (cA + conj(cA))/2 → mixed Wirtinger chain rule:
+        //   ∂L/∂conj(cA) = step/2*(conj(pA)*adj_qB + conj(pA)*conj(adj_qB))
+        //                = step * Re(conj(pA) * adj_qB)
+        double q_to_c = step_size * std::real(std::conj(st.pA) * a_q_acc);
+        a_c_step += C(q_to_c);
+
+        // Distribute adj_c to node k (holomorphic): cA = A1/k1 + A2/k2 + A3/k3
+        //   ∂cA/∂ki = -Ai/ki²  →  conj(...) = -Ai/conj(ki²)
+        C k1 = nk[st.s1*M_max+mode], k2 = nk[st.s2*M_max+mode], k3 = nk[st.s3*M_max+mode];
+        gk[st.s1*M_max+mode] += a_c_step * C(-st.A1) / std::conj(k1*k1);
+        gk[st.s2*M_max+mode] += a_c_step * C(-st.A2) / std::conj(k2*k2);
+        gk[st.s3*M_max+mode] += a_c_step * C(-st.A3) / std::conj(k3*k3);
+      }
+
+      // Distribute accumulated phi_src gradient to source element nodes
+      if (std::abs(grad_phi_src_acc) > 1e-30) {
+        gps[src_s1*M_max+mode] += grad_phi_src_acc * C(src_A1);
+        gps[src_s2*M_max+mode] += grad_phi_src_acc * C(src_A2);
+        gps[src_s3*M_max+mode] += grad_phi_src_acc * C(src_A3);
       }
     }
   }
-  return std::make_tuple(grad_k, grad_phi_r);
+  return std::make_tuple(grad_k, grad_phi_s, grad_phi_r);
 }
 
 } // namespace

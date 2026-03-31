@@ -40,7 +40,6 @@ from .eigvec_adjoint import (
     tridiag_eigvec_reattach_varying_batch,
 )
 from .elastic_propagation import ElasticPropagationFn, elastic_propagation
-from .krakel_ift import krakel_eigenvalue_ift
 from .kraken_ift import (
     KrakenEigenvalueIFT,
     kraken_acoustic_bottom_ift,
@@ -94,7 +93,6 @@ __all__ = [
     "tridiag_eigvec_reattach_varying_batch",
     "ElasticPropagationFn",
     "elastic_propagation",
-    "krakel_eigenvalue_ift",
     "KrakenEigenvalueIFT",
     "kraken_acoustic_bottom_ift",
     "krakenc_vacuum_acoustic_bottom_ift",

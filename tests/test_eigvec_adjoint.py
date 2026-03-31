@@ -247,5 +247,7 @@ def test_tridiag_eigvec_reattach_varying_batch_matches_single_mode_calls():
         grad_d_ref[m] = d_m.grad
         grad_e_ref[m] = e_m.grad
 
-    torch.testing.assert_close(d_batch.grad, grad_d_ref, atol=1e-10, rtol=1e-10)
-    torch.testing.assert_close(e_batch.grad, grad_e_ref, atol=1e-10, rtol=1e-10)
+    # Tolerance relaxed: batch uses solve_tridiag (Thomas) while single uses
+    # solve_banded (sparse LU) — different O(eps) rounding in the two algorithms.
+    torch.testing.assert_close(d_batch.grad, grad_d_ref, atol=1e-8, rtol=1e-8)
+    torch.testing.assert_close(e_batch.grad, grad_e_ref, atol=1e-8, rtol=1e-8)

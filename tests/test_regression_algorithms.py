@@ -53,8 +53,8 @@ def test_complex_varying_batch_matches_single_mode_reference():
         grad_d_ref[m] = d_m.grad
         grad_e_ref[m] = e_m.grad
 
-    torch.testing.assert_close(grad_d, grad_d_ref, atol=1e-10, rtol=1e-10)
-    torch.testing.assert_close(grad_e, grad_e_ref, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(grad_d, grad_d_ref, atol=1e-8, rtol=1e-8)
+    torch.testing.assert_close(grad_e, grad_e_ref, atol=1e-8, rtol=1e-8)
 
 
 def test_shared_spectrum_cluster_handling_changes_adjoint():

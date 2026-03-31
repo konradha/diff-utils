@@ -3,7 +3,6 @@ import importlib
 import os
 from pathlib import Path
 import subprocess
-import sys
 
 _CPU_EXT = None
 _CPU_EXT_FAILED = False
