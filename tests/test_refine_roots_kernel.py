@@ -108,7 +108,9 @@ def test_refine_roots_kernel_reduces_dispersion_residual(name: str):
         ("calibKgrad", 33, -1.0),
     ],
 )
-def test_refine_roots_kernel_returns_expected_tail_branch(name: str, mode_index: int, expected_sign: float):
+def test_refine_roots_kernel_returns_expected_tail_branch(
+    name: str, mode_index: int, expected_sign: float
+):
     env, ws, _fwd, x_refined, signs = _run_refine_kernel(name)
 
     idx = mode_index - 1
@@ -117,7 +119,9 @@ def test_refine_roots_kernel_returns_expected_tail_branch(name: str, mode_index:
 
     resid_pos = abs(dispersion_complex(x_mode, ws, env, bottom_branch_sign=1.0))
     resid_neg = abs(dispersion_complex(x_mode, ws, env, bottom_branch_sign=-1.0))
-    assert abs(resid_pos - resid_neg) > 1e-12, "branch preference is too ambiguous for this regression"
+    assert abs(resid_pos - resid_neg) > 1e-12, (
+        "branch preference is too ambiguous for this regression"
+    )
 
     python_sign = select_supported_krakenc_bottom_branch_sign(x_mode, ws, env)
     assert python_sign == expected_sign
@@ -138,10 +142,7 @@ def test_refine_roots_kernel_matches_high_level_krakenc_roots(name: str):
     # modes but may differ for near-cutoff modes. Accept 1% relative tolerance.
     torch.testing.assert_close(x_refined[order], result.x, rtol=1e-2, atol=1e-6)
     selected_signs = torch.tensor(
-        [
-            select_supported_krakenc_bottom_branch_sign(complex(x.item()), ws, env)
-            for x in result.x
-        ],
+        [select_supported_krakenc_bottom_branch_sign(complex(x.item()), ws, env) for x in result.x],
         dtype=torch.float64,
     )
     # Branch signs may differ for near-cutoff modes where roots diverge

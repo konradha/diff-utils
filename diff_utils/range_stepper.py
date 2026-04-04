@@ -42,16 +42,35 @@ def range_stepper_batched(
     M_cur = M
     r_prev = 0.0
 
+    # Porter truncates mode amplitudes to single precision (CMPLX) at
+    # every range step.  This matters: at 1500 Hz with k~6.28, the
+    # accumulated phase after 800 steps is ~25000 rad.  Single-precision
+    # truncation shifts the interference pattern, and matching Porter
+    # requires replicating this truncation.
+    _diff_mode = A0.requires_grad or k.requires_grad
+
+    def _cmplx(t: torch.Tensor) -> torch.Tensor:
+        if _diff_mode:
+            return t  # skip truncation to preserve autograd graph
+        return t.to(torch.complex64).to(torch.complex128)
+
     for seg in range(n_segments):
         if seg > 0 and N_b > 0:
             r_bnd = r_boundaries[seg - 1].item()
             dr_to_boundary = r_bnd - r_prev
             if dr_to_boundary > 0:
-                A_cur = A_cur[:M_cur] * torch.exp(-1j * k_cur[:M_cur] * dr_to_boundary)
+                A_cur = _cmplx(A_cur[:M_cur] * torch.exp(-1j * k_cur[:M_cur] * dr_to_boundary))
             r_prev = r_bnd
             if C_interfaces is not None and seg - 1 < len(C_interfaces):
                 C = C_interfaces[seg - 1]
-                A_cur = C.T.to(torch.complex128) @ A_cur[:M_cur].to(torch.complex128)
+                # Porter truncates to MIN(M_L, M_R). Coupling matrix is
+                # square [M_couple, M_couple]; truncate A_cur to match.
+                M_couple = C.shape[0]
+                M_use = min(M_cur, M_couple)
+                A_in = A_cur[:M_use].to(torch.complex128)
+                if M_use < M_couple:
+                    A_in = torch.nn.functional.pad(A_in, (0, M_couple - M_use))
+                A_cur = C.T.to(torch.complex128) @ A_in
                 M_cur = A_cur.shape[0]
 
             if k_segments is not None and seg < len(k_segments):
@@ -71,7 +90,8 @@ def range_stepper_batched(
         A_at_receivers = A_cur[:M_cur].unsqueeze(1) * phase  # [M_cur, N_seg]
 
         idx = mask.nonzero(as_tuple=True)[0]
-        A_out[:M_cur, idx] = A_at_receivers
+        M_write = min(M_cur, A_out.shape[0])
+        A_out[:M_write, idx] = A_at_receivers[:M_write]
 
     return A_out
 

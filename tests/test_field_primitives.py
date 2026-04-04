@@ -9,10 +9,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from diff_utils.mode_coupling import mode_coupling
 from diff_utils.range_stepper import range_stepper, range_stepper_batched
 from diff_utils.interp import interp_batch, searchsorted_lerp
-from diff_utils.weighted_depth_integral import (
-    weighted_depth_integral,
-    weighted_depth_inner_product,
-)
 
 
 def test_mode_coupling_self():
@@ -134,42 +130,6 @@ def test_interp_batch_gradcheck():
         return interp_batch(z, v, q).sum()
 
     assert gradcheck(fn, (values,), eps=1e-7, atol=1e-5)
-
-
-def test_weighted_depth_integral_constant():
-    z = torch.linspace(0, 10, 100, dtype=torch.float64)
-    f = torch.ones(100, dtype=torch.float64)
-    rho = torch.ones(100, dtype=torch.float64)
-    result = weighted_depth_integral(f, z, rho)
-    assert abs(result.item() - 10.0) < 1e-10
-
-
-def test_weighted_depth_integral_with_rho():
-    z = torch.linspace(0, 10, 100, dtype=torch.float64)
-    f = torch.ones(100, dtype=torch.float64)
-    rho = torch.full((100,), 2.0, dtype=torch.float64)
-    result = weighted_depth_integral(f, z, rho)
-    assert abs(result.item() - 5.0) < 1e-10
-
-
-def test_weighted_depth_inner_product_matrix():
-    z = torch.linspace(0, 10, 50, dtype=torch.float64)
-    f = torch.randn(3, 50, dtype=torch.float64)
-    g = torch.randn(4, 50, dtype=torch.float64)
-    rho = torch.ones(50, dtype=torch.float64)
-    C = weighted_depth_inner_product(f, g, z, rho)
-    assert C.shape == (3, 4)
-
-
-def test_weighted_depth_integral_gradcheck():
-    z = torch.linspace(0, 10, 20, dtype=torch.float64)
-    f = torch.randn(20, dtype=torch.float64, requires_grad=True)
-    rho = torch.ones(20, dtype=torch.float64)
-
-    def fn(ff):
-        return weighted_depth_integral(ff, z, rho)
-
-    assert gradcheck(fn, (f,), eps=1e-7, atol=1e-5)
 
 
 def test_batched_single_segment_parity():

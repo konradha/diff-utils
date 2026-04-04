@@ -425,20 +425,20 @@ acoustic_recurrence_fwd(torch::Tensor B1, torch::Tensor h2k2, int64_t loc_start,
         scalar_t *RESTRICT ph = p_history.data_ptr<scalar_t>();
 
         for (int64_t m = 0; m < M; ++m) {
-            scalar_t p0 = p1i[m];
-            scalar_t p1 = p1i[m];
-            scalar_t p2 = p2i[m];
-            scalar_t hk_m = hk[m];
+          scalar_t p0 = p1i[m];
+          scalar_t p1 = p1i[m];
+          scalar_t p2 = p2i[m];
+          scalar_t hk_m = hk[m];
 
-            for (int64_t s = 0; s < sweep_len; ++s) {
-              int64_t jj = loc_end - s;
-              p0 = p1;
-              p1 = p2;
-              p2 = (hk_m - b1[jj]) * p1 - p0;
-              ph[m * sweep_len + s] = p1;
-            }
-            fn[m] = -(p2 - p0);
-            gv[m] = -p1;
+          for (int64_t s = 0; s < sweep_len; ++s) {
+            int64_t jj = loc_end - s;
+            p0 = p1;
+            p1 = p2;
+            p2 = (hk_m - b1[jj]) * p1 - p0;
+            ph[m * sweep_len + s] = p1;
+          }
+          fn[m] = -(p2 - p0);
+          gv[m] = -p1;
         }
       });
 
@@ -487,7 +487,7 @@ acoustic_recurrence_bwd(torch::Tensor grad_f_num, torch::Tensor grad_g_val,
           // Adjoint variables grow exponentially (same recurrence as forward).
           // Periodic rescaling prevents overflow and preserves precision in
           // the accumulated gradient products d_p2 * p_history.
-          double adj_scale = 1.0;  // cumulative rescaling factor
+          double adj_scale = 1.0; // cumulative rescaling factor
           const double ADJ_ROOF = 1e30;
           const double ADJ_FLOOR = 1e-30;
 
@@ -670,17 +670,17 @@ torch::Tensor solve_tridiag_batch(torch::Tensor dl, torch::Tensor d_batch,
         const scalar_t *RESTRICT dup = du.data_ptr<scalar_t>();
 
         for (int64_t m = 0; m < M; ++m) {
-            scalar_t *RESTRICT dm = dw + m * N;
-            scalar_t *RESTRICT xm = xp + m * N;
-            for (int64_t i = 1; i < N; ++i) {
-              scalar_t w = dlp[i - 1] / dm[i - 1];
-              dm[i] -= w * dup[i - 1];
-              xm[i] -= w * xm[i - 1];
-            }
-            xm[N - 1] /= dm[N - 1];
-            for (int64_t i = N - 2; i >= 0; --i) {
-              xm[i] = (xm[i] - dup[i] * xm[i + 1]) / dm[i];
-            }
+          scalar_t *RESTRICT dm = dw + m * N;
+          scalar_t *RESTRICT xm = xp + m * N;
+          for (int64_t i = 1; i < N; ++i) {
+            scalar_t w = dlp[i - 1] / dm[i - 1];
+            dm[i] -= w * dup[i - 1];
+            xm[i] -= w * xm[i - 1];
+          }
+          xm[N - 1] /= dm[N - 1];
+          for (int64_t i = N - 2; i >= 0; --i) {
+            xm[i] = (xm[i] - dup[i] * xm[i + 1]) / dm[i];
+          }
         }
       });
 
@@ -786,6 +786,10 @@ static DispResult dispersion_eval(
     int64_t loc_s = layer_loc[li];
     int64_t loc_e = loc_s + layer_n[li] - 1;
 
+    // Porter's Roof/Floor constants for overflow rescaling
+    static constexpr double ROOF = 1.0e50;
+    static constexpr double FLOOR = 1.0e-50;
+
     double p1v = -2.0 * g;
     double p2v = (b1[loc_e] - h2k2) * g - 2.0 * h * f * rho;
     double p0v = p1v;
@@ -796,8 +800,15 @@ static DispResult dispersion_eval(
       p0v = p1v;
       p1v = p2v;
       p2v = (h2k2 - b1[jj]) * p1v - p0v;
-      if (count_modes && p0v * p1v <= 0.0 && p0v != 0.0)
+      // Porter: IF (p0*p1 <= 0) modeCount++ — no p0!=0 guard
+      if (count_modes && p0v * p1v <= 0.0)
         ++mode_count;
+      // Porter: overflow rescaling to prevent inf in the recurrence
+      if (std::abs(p2v) > ROOF) {
+        p0v *= FLOOR;
+        p1v *= FLOOR;
+        p2v *= FLOOR;
+      }
     }
 
     double rho_top = layer_rho[li];
@@ -813,7 +824,9 @@ static DispResult dispersion_eval(
 
   double Delta = f * g_top - g * f_top;
 
-  if (!count_modes && g * Delta > 0.0)
+  // Porter: IF (g * Delta > 0) modeCount = modeCount + 1 — always, not
+  // conditional on CountModes.
+  if (g * Delta > 0.0)
     mode_count += 1;
 
   if (mode > 0 && prev_eigenvalues != nullptr) {
@@ -854,77 +867,119 @@ static double zbrent(const double *b1, int64_t n_layers,
       dispersion_eval(x2, b1, n_layers, layer_loc, layer_n, layer_h, layer_rho,
                       omega2, bc_bot, bc_top, false, mode, prev_eigenvalues);
 
-  int64_t ip_ref = std::max(r1.iPower, r2.iPower);
-  double f1 = r1.Delta * std::pow(10.0, (double)(r1.iPower - ip_ref));
-  double f2 = r2.Delta * std::pow(10.0, (double)(r2.iPower - ip_ref));
+  // Porter's ZBRENTX: track iPower per point (iExpA, iExpB, iExpC) and
+  // adjust for iPower differences when computing ratios. Our previous
+  // implementation used a fixed ip_ref which becomes inaccurate when
+  // iPower drifts near cutoff.
 
-  if (f1 * f2 > 0.0)
+  if (r1.Delta * r2.Delta > 0.0 && r1.iPower == r2.iPower)
     return 0.5 * (x1 + x2);
 
-  double a = x1, b = x2, fa = f1, fb = f2;
-  double c = b, fc = fb;
+  double a = x1, b = x2;
+  double fa = r1.Delta, fb = r2.Delta;
+  int64_t iExpA = r1.iPower, iExpB = r2.iPower;
+  double c = a, fc = fa;
+  int64_t iExpC = iExpA;
   double d = b - a, e = d;
+  const double TEN = 10.0;
+  const double MACHEP = 1.0e-16;
 
   for (int iter = 0; iter < 200; ++iter) {
-    if (fb * fc > 0.0) {
+    // Porter GOTO 2000: reset c = a if fb and fc have same sign
+    double fb_scaled, fc_scaled;
+    if (iExpB < iExpC) {
+      fb_scaled = fb;
+      fc_scaled = fc * std::pow(TEN, (double)(iExpC - iExpB));
+    } else {
+      fb_scaled = fb * std::pow(TEN, (double)(iExpB - iExpC));
+      fc_scaled = fc;
+    }
+    if ((fb_scaled > 0.0) == (fc_scaled > 0.0)) {
       c = a;
       fc = fa;
-      d = e = b - a;
+      iExpC = iExpA;
+      e = b - a;
+      d = e;
     }
-    if (std::abs(fc) < std::abs(fb)) {
+
+    // Porter: compare |f1| < |f2| with iPower adjustment
+    double F1, F2;
+    if (iExpC < iExpB) {
+      F1 = fc * std::pow(TEN, (double)(iExpC - iExpB));
+      F2 = fb;
+    } else {
+      F1 = fc;
+      F2 = fb * std::pow(TEN, (double)(iExpB - iExpC));
+    }
+    if (std::abs(F1) < std::abs(F2)) {
       a = b;
-      fa = fb;
       b = c;
-      fb = fc;
       c = a;
+      fa = fb;
+      fb = fc;
       fc = fa;
+      iExpA = iExpB;
+      iExpB = iExpC;
+      iExpC = iExpA;
+      // recompute for ratio below
+      iExpA = iExpC; // after swap, a's exp is what was c's
     }
 
-    double tol1 = 2.0e-16 * std::abs(b) + 0.5 * tol;
+    double TOL1 = 2.0 * MACHEP * std::abs(b) + tol;
     double xm = 0.5 * (c - b);
-
-    if (std::abs(xm) <= tol1 || fb == 0.0)
+    if (std::abs(xm) <= TOL1 || fb == 0.0)
       return b;
 
-    if (std::abs(e) >= tol1 && std::abs(fa) > std::abs(fb)) {
-      double s = fb / fa;
+    // Bisection forced?
+    if (iExpA < iExpB) {
+      F1 = fa * std::pow(TEN, (double)(iExpA - iExpB));
+      F2 = fb;
+    } else {
+      F1 = fa;
+      F2 = fb * std::pow(TEN, (double)(iExpB - iExpA));
+    }
+    if (std::abs(e) < TOL1 || std::abs(F1) <= std::abs(F2)) {
+      e = xm;
+      d = e;
+    } else {
+      double s = fb / fa * std::pow(TEN, (double)(iExpB - iExpA));
       double p, q;
       if (a == c) {
         p = 2.0 * xm * s;
         q = 1.0 - s;
       } else {
-        q = fa / fc;
-        double r = fb / fc;
+        q = fa / fc * std::pow(TEN, (double)(iExpA - iExpC));
+        double r = fb / fc * std::pow(TEN, (double)(iExpB - iExpC));
         p = s * (2.0 * xm * q * (q - r) - (b - a) * (r - 1.0));
         q = (q - 1.0) * (r - 1.0) * (s - 1.0);
       }
       if (p > 0.0)
         q = -q;
       p = std::abs(p);
-      if (2.0 * p <
-          std::min(3.0 * xm * q - std::abs(tol1 * q), std::abs(e * q))) {
-        e = d;
+      double s_old = e;
+      e = d;
+      if (2.0 * p < 3.0 * xm * q - std::abs(TOL1 * q) &&
+          p < std::abs(0.5 * s_old * q)) {
         d = p / q;
       } else {
-        d = xm;
-        e = d;
+        e = xm;
+        d = e;
       }
-    } else {
-      d = xm;
-      e = d;
     }
 
     a = b;
     fa = fb;
-    if (std::abs(d) > tol1)
+    iExpA = iExpB;
+    if (std::abs(d) > TOL1)
       b += d;
     else
-      b += (xm >= 0.0 ? tol1 : -tol1);
+      b += (xm >= 0.0 ? TOL1 : -TOL1);
 
     auto rb =
         dispersion_eval(b, b1, n_layers, layer_loc, layer_n, layer_h, layer_rho,
                         omega2, bc_bot, bc_top, false, mode, prev_eigenvalues);
-    fb = rb.Delta * std::pow(10.0, (double)(rb.iPower - ip_ref));
+    fb = rb.Delta;
+    iExpB = rb.iPower;
   }
   return b;
 }
@@ -998,6 +1053,7 @@ std::tuple<torch::Tensor, int64_t> acoustic_solve1(
     return std::make_tuple(torch::empty({0}, torch::kFloat64), (int64_t)0);
   }
 
+  // Simple bisection: isolate each eigenvalue independently
   std::vector<double> x_l(M, x_min), x_r(M, x_max);
   std::unordered_map<int64_t, int64_t> mc_cache;
 
@@ -1090,11 +1146,10 @@ acoustic_solve2(torch::Tensor B1, torch::Tensor layer_loc_t,
 
 // --- Batched inverse iteration (per-mode local buffer, cache-friendly) ---
 
-torch::Tensor tridiag_inverse_iteration_batch_cpp(
-    torch::Tensor d_batch,   // [M, N]
-    torch::Tensor e,         // [N-1]
-    int64_t n_iter
-) {
+torch::Tensor
+tridiag_inverse_iteration_batch_cpp(torch::Tensor d_batch, // [M, N]
+                                    torch::Tensor e,       // [N-1]
+                                    int64_t n_iter) {
   TORCH_CHECK(d_batch.dim() == 2, "d_batch must be 2D");
   TORCH_CHECK(e.dim() == 1, "e must be 1D");
   const int64_t M = d_batch.size(0);
@@ -1118,40 +1173,43 @@ torch::Tensor tridiag_inverse_iteration_batch_cpp(
         // Single pre-allocated work buffer, reused across modes
         std::vector<scalar_t> dw_local(N);
         for (int64_t m = 0; m < M; ++m) {
-            const scalar_t *RESTRICT d_m = d_src + m * N;
-            scalar_t *RESTRICT pm = pp + m * N;
+          const scalar_t *RESTRICT d_m = d_src + m * N;
+          scalar_t *RESTRICT pm = pp + m * N;
 
-            for (int64_t iter = 0; iter < n_iter; ++iter) {
-              std::memcpy(dw_local.data(), d_m, N * sizeof(scalar_t));
-              for (int64_t i = 1; i < N; ++i) {
-                scalar_t w = ep[i - 1] / dw_local[i - 1];
-                dw_local[i] -= w * ep[i - 1];
-                pm[i] -= w * pm[i - 1];
-              }
-              pm[N - 1] /= dw_local[N - 1];
-              for (int64_t i = N - 2; i >= 0; --i) {
-                pm[i] = (pm[i] - ep[i] * pm[i + 1]) / dw_local[i];
-              }
-              double max_abs = 0.0;
-              for (int64_t i = 0; i < N; ++i) {
-                double a = std::abs(pm[i]);
-                if (a > max_abs) max_abs = a;
-              }
-              if (max_abs > 0.0) {
-                scalar_t inv = scalar_t(1.0 / max_abs);
-                for (int64_t i = 0; i < N; ++i) pm[i] *= inv;
-              }
+          for (int64_t iter = 0; iter < n_iter; ++iter) {
+            std::memcpy(dw_local.data(), d_m, N * sizeof(scalar_t));
+            for (int64_t i = 1; i < N; ++i) {
+              scalar_t w = ep[i - 1] / dw_local[i - 1];
+              dw_local[i] -= w * ep[i - 1];
+              pm[i] -= w * pm[i - 1];
             }
-            double sq_sum = 0.0;
+            pm[N - 1] /= dw_local[N - 1];
+            for (int64_t i = N - 2; i >= 0; --i) {
+              pm[i] = (pm[i] - ep[i] * pm[i + 1]) / dw_local[i];
+            }
+            double max_abs = 0.0;
             for (int64_t i = 0; i < N; ++i) {
               double a = std::abs(pm[i]);
-              sq_sum += a * a;
+              if (a > max_abs)
+                max_abs = a;
             }
-            double norm = std::sqrt(sq_sum);
-            if (norm > 0.0) {
-              scalar_t inv_norm = scalar_t(1.0 / norm);
-              for (int64_t i = 0; i < N; ++i) pm[i] *= inv_norm;
+            if (max_abs > 0.0) {
+              scalar_t inv = scalar_t(1.0 / max_abs);
+              for (int64_t i = 0; i < N; ++i)
+                pm[i] *= inv;
             }
+          }
+          double sq_sum = 0.0;
+          for (int64_t i = 0; i < N; ++i) {
+            double a = std::abs(pm[i]);
+            sq_sum += a * a;
+          }
+          double norm = std::sqrt(sq_sum);
+          if (norm > 0.0) {
+            scalar_t inv_norm = scalar_t(1.0 / norm);
+            for (int64_t i = 0; i < N; ++i)
+              pm[i] *= inv_norm;
+          }
         }
       });
 
@@ -1161,16 +1219,15 @@ torch::Tensor tridiag_inverse_iteration_batch_cpp(
 // --- Fused assembly + inverse iteration (no d_batch allocation) ---
 
 torch::Tensor fused_assembly_inverse_iteration_cpp(
-    torch::Tensor base_d,       // [N] complex128 — shared base diagonal
-    torch::Tensor h2_factor,    // [N] complex128 — shared h^2/(h*rho) factor
-    torch::Tensor x_batch,      // [M] complex128 — eigenvalues
-    torch::Tensor e,            // [N-1] complex128 — shared off-diagonal
-    torch::Tensor bc_top_ratio, // [M] complex128 — f/g at top per mode
-    torch::Tensor bc_bot_ratio, // [M] complex128 — f/g at bottom per mode
-    torch::Tensor bc_top_vacuum,// [M] bool
-    torch::Tensor bc_bot_vacuum,// [M] bool
-    int64_t n_iter
-) {
+    torch::Tensor base_d,        // [N] complex128 — shared base diagonal
+    torch::Tensor h2_factor,     // [N] complex128 — shared h^2/(h*rho) factor
+    torch::Tensor x_batch,       // [M] complex128 — eigenvalues
+    torch::Tensor e,             // [N-1] complex128 — shared off-diagonal
+    torch::Tensor bc_top_ratio,  // [M] complex128 — f/g at top per mode
+    torch::Tensor bc_bot_ratio,  // [M] complex128 — f/g at bottom per mode
+    torch::Tensor bc_top_vacuum, // [M] bool
+    torch::Tensor bc_bot_vacuum, // [M] bool
+    int64_t n_iter) {
   using C = c10::complex<double>;
   const int64_t M = x_batch.size(0);
   const int64_t N = base_d.size(0);
@@ -1182,15 +1239,15 @@ torch::Tensor fused_assembly_inverse_iteration_cpp(
 
   auto phi = torch::full({M, N}, C(1e-10), base_d.options());
 
-  const C *RESTRICT bd = reinterpret_cast<const C*>(base_d.data_ptr());
-  const C *RESTRICT hf = reinterpret_cast<const C*>(h2_factor.data_ptr());
-  const C *RESTRICT xp = reinterpret_cast<const C*>(x_batch.data_ptr());
-  const C *RESTRICT ep = reinterpret_cast<const C*>(e.data_ptr());
-  const C *RESTRICT tr = reinterpret_cast<const C*>(bc_top_ratio.data_ptr());
-  const C *RESTRICT br = reinterpret_cast<const C*>(bc_bot_ratio.data_ptr());
+  const C *RESTRICT bd = reinterpret_cast<const C *>(base_d.data_ptr());
+  const C *RESTRICT hf = reinterpret_cast<const C *>(h2_factor.data_ptr());
+  const C *RESTRICT xp = reinterpret_cast<const C *>(x_batch.data_ptr());
+  const C *RESTRICT ep = reinterpret_cast<const C *>(e.data_ptr());
+  const C *RESTRICT tr = reinterpret_cast<const C *>(bc_top_ratio.data_ptr());
+  const C *RESTRICT br = reinterpret_cast<const C *>(bc_bot_ratio.data_ptr());
   const bool *RESTRICT tv = bc_top_vacuum.data_ptr<bool>();
   const bool *RESTRICT bv = bc_bot_vacuum.data_ptr<bool>();
-  C *RESTRICT pp = reinterpret_cast<C*>(phi.data_ptr());
+  C *RESTRICT pp = reinterpret_cast<C *>(phi.data_ptr());
 
   {
     std::vector<C> dw(N);
@@ -1203,41 +1260,68 @@ torch::Tensor fused_assembly_inverse_iteration_cpp(
         dw[i] = bd[i] - x_m * hf[i];
 
       // BC injection
-      if (tv[m]) { dw[0] = C(1.0); /* e[0] already 0 in e */ }
-      else       { dw[0] = dw[0] / C(2.0) + tr[m]; }
-      if (bv[m]) { dw[N-1] = C(1.0); }
-      else       { dw[N-1] = dw[N-1] / C(2.0) - br[m]; }
+      if (tv[m]) {
+        dw[0] = C(1.0); /* e[0] already 0 in e */
+      } else {
+        dw[0] = dw[0] / C(2.0) + tr[m];
+      }
+      if (bv[m]) {
+        dw[N - 1] = C(1.0);
+      } else {
+        dw[N - 1] = dw[N - 1] / C(2.0) - br[m];
+      }
 
       for (int64_t iter = 0; iter < n_iter; ++iter) {
         // Restore diagonal (assembly is cheap, avoids copy)
         if (iter > 0) {
           for (int64_t i = 0; i < N; ++i)
             dw[i] = bd[i] - x_m * hf[i];
-          if (tv[m]) dw[0] = C(1.0); else dw[0] = dw[0]/C(2.0) + tr[m];
-          if (bv[m]) dw[N-1] = C(1.0); else dw[N-1] = dw[N-1]/C(2.0) - br[m];
+          if (tv[m])
+            dw[0] = C(1.0);
+          else
+            dw[0] = dw[0] / C(2.0) + tr[m];
+          if (bv[m])
+            dw[N - 1] = C(1.0);
+          else
+            dw[N - 1] = dw[N - 1] / C(2.0) - br[m];
         }
 
         // Thomas forward elimination
         for (int64_t i = 1; i < N; ++i) {
-          C w = ep[i-1] / dw[i-1];
-          dw[i] -= w * ep[i-1];
-          pm[i] -= w * pm[i-1];
+          C w = ep[i - 1] / dw[i - 1];
+          dw[i] -= w * ep[i - 1];
+          pm[i] -= w * pm[i - 1];
         }
-        pm[N-1] /= dw[N-1];
-        for (int64_t i = N-2; i >= 0; --i)
-          pm[i] = (pm[i] - ep[i] * pm[i+1]) / dw[i];
+        pm[N - 1] /= dw[N - 1];
+        for (int64_t i = N - 2; i >= 0; --i)
+          pm[i] = (pm[i] - ep[i] * pm[i + 1]) / dw[i];
 
         // Normalize
         double mx = 0.0;
-        for (int64_t i = 0; i < N; ++i) { double a = std::abs(pm[i]); if (a > mx) mx = a; }
-        if (mx > 0.0) { C inv(1.0/mx); for (int64_t i = 0; i < N; ++i) pm[i] *= inv; }
+        for (int64_t i = 0; i < N; ++i) {
+          double a = std::abs(pm[i]);
+          if (a > mx)
+            mx = a;
+        }
+        if (mx > 0.0) {
+          C inv(1.0 / mx);
+          for (int64_t i = 0; i < N; ++i)
+            pm[i] *= inv;
+        }
       }
 
       // Final L2 norm
       double sq = 0.0;
-      for (int64_t i = 0; i < N; ++i) { double a = std::abs(pm[i]); sq += a*a; }
+      for (int64_t i = 0; i < N; ++i) {
+        double a = std::abs(pm[i]);
+        sq += a * a;
+      }
       double nrm = std::sqrt(sq);
-      if (nrm > 0.0) { C inv(1.0/nrm); for (int64_t i = 0; i < N; ++i) pm[i] *= inv; }
+      if (nrm > 0.0) {
+        C inv(1.0 / nrm);
+        for (int64_t i = 0; i < N; ++i)
+          pm[i] *= inv;
+      }
     }
   }
   return phi;
@@ -1245,17 +1329,20 @@ torch::Tensor fused_assembly_inverse_iteration_cpp(
 
 // --- Complex batched dispersion (no p_history allocation) ---
 
-static inline void bc_impedance_complex(
-    c10::complex<double> x, double omega2,
-    double cp_r, double c_imag_p, double cs_r, double c_imag_s,
-    double rho, int bc_type, bool is_top,
-    c10::complex<double> branch_sign,
-    c10::complex<double> &f, c10::complex<double> &g) {
+static inline void
+bc_impedance_complex(c10::complex<double> x, double omega2, double cp_r,
+                     double c_imag_p, double cs_r, double c_imag_s, double rho,
+                     int bc_type, bool is_top, c10::complex<double> branch_sign,
+                     c10::complex<double> &f, c10::complex<double> &g) {
 
   using C = c10::complex<double>;
-  if (bc_type == 1 || rho >= 1e10) { f = C(0.0, 0.0); g = C(1.0, 0.0); }
-  else if (bc_type == 0 || rho == 0.0) { f = C(1.0, 0.0); g = C(0.0, 0.0); }
-  else if (cs_r > 0.0) {
+  if (bc_type == 1 || rho >= 1e10) {
+    f = C(0.0, 0.0);
+    g = C(1.0, 0.0);
+  } else if (bc_type == 0 || rho == 0.0) {
+    f = C(1.0, 0.0);
+    g = C(0.0, 0.0);
+  } else if (cs_r > 0.0) {
     C cp_c(cp_r, c_imag_p), cs_c(cs_r, c_imag_s);
     C gammaS2 = x - omega2 / (cs_c * cs_c);
     C gammaP2 = x - omega2 / (cp_c * cp_c);
@@ -1270,25 +1357,26 @@ static inline void bc_impedance_complex(
     f = branch_sign * std::sqrt(gamma2);
     g = C(rho, 0.0);
   }
-  if (is_top) g = -g;
+  if (is_top)
+    g = -g;
 }
 
 torch::Tensor dispersion_complex_batch_cpp(
-    torch::Tensor x_batch,      // [M] complex128
-    torch::Tensor B1,            // [N] float64 or complex128
-    torch::Tensor layer_loc,     // [n_layers] int64
-    torch::Tensor layer_n,       // [n_layers] int64
-    torch::Tensor layer_h,       // [n_layers] float64
-    torch::Tensor layer_rho,     // [n_layers] float64
+    torch::Tensor x_batch,   // [M] complex128
+    torch::Tensor B1,        // [N] float64 or complex128
+    torch::Tensor layer_loc, // [n_layers] int64
+    torch::Tensor layer_n,   // [n_layers] int64
+    torch::Tensor layer_h,   // [n_layers] float64
+    torch::Tensor layer_rho, // [n_layers] float64
     double omega2,
     // bottom BC params
-    int64_t bc_bot_type, double bot_cp, double bot_c_imag_p,
-    double bot_cs, double bot_c_imag_s, double bot_rho,
+    int64_t bc_bot_type, double bot_cp, double bot_c_imag_p, double bot_cs,
+    double bot_c_imag_s, double bot_rho,
     // top BC params
-    int64_t bc_top_type, double top_cp, double top_c_imag_p,
-    double top_cs, double top_c_imag_s, double top_rho,
+    int64_t bc_top_type, double top_cp, double top_c_imag_p, double top_cs,
+    double top_c_imag_s, double top_rho,
     // branch signs per mode
-    torch::Tensor branch_signs   // [M] float64
+    torch::Tensor branch_signs // [M] float64
 ) {
   using C = c10::complex<double>;
   const int64_t M = x_batch.size(0);
@@ -1305,59 +1393,50 @@ torch::Tensor dispersion_complex_batch_cpp(
   const double *RESTRICT bsigns = branch_signs.data_ptr<double>();
 
   for (int64_t m = 0; m < M; ++m) {
-      C x = xp[m];
-      C bsign(bsigns[m], 0.0);
-      C f, g;
-      bc_impedance_complex(x, omega2, bot_cp, bot_c_imag_p,
-                           bot_cs, bot_c_imag_s, bot_rho,
-                           bc_bot_type, false, bsign, f, g);
+    C x = xp[m];
+    C bsign(bsigns[m], 0.0);
+    C f, g;
+    bc_impedance_complex(x, omega2, bot_cp, bot_c_imag_p, bot_cs, bot_c_imag_s,
+                         bot_rho, bc_bot_type, false, bsign, f, g);
 
-      for (int64_t li = n_layers - 1; li >= 0; --li) {
-        double h = lh[li];
-        C h2k2 = h * h * x;
-        double rho = lr[li];
-        int64_t loc_s = ll[li];
-        int64_t loc_e = loc_s + ln[li] - 1;
+    for (int64_t li = n_layers - 1; li >= 0; --li) {
+      double h = lh[li];
+      C h2k2 = h * h * x;
+      double rho = lr[li];
+      int64_t loc_s = ll[li];
+      int64_t loc_e = loc_s + ln[li] - 1;
 
-        C p1 = C(-2.0) * g;
-        C p2 = (C(b1[loc_e]) - h2k2) * g - C(2.0 * h) * f * C(rho);
-        C p0 = p1;
+      C p1 = C(-2.0) * g;
+      C p2 = (C(b1[loc_e]) - h2k2) * g - C(2.0 * h) * f * C(rho);
+      C p0 = p1;
 
-        int64_t sweep_len = loc_e - 1 - loc_s + 1;
-        for (int64_t s = 0; s < sweep_len; ++s) {
-          int64_t jj = (loc_e - 1) - s;
-          p0 = p1;
-          p1 = p2;
-          p2 = (h2k2 - C(b1[jj])) * p1 - p0;
-        }
-        f = -(p2 - p0) / C(2.0 * h * rho);
-        g = -p1;
+      int64_t sweep_len = loc_e - 1 - loc_s + 1;
+      for (int64_t s = 0; s < sweep_len; ++s) {
+        int64_t jj = (loc_e - 1) - s;
+        p0 = p1;
+        p1 = p2;
+        p2 = (h2k2 - C(b1[jj])) * p1 - p0;
       }
+      f = -(p2 - p0) / C(2.0 * h * rho);
+      g = -p1;
+    }
 
-      C f_top, g_top;
-      bc_impedance_complex(x, omega2, top_cp, top_c_imag_p,
-                           top_cs, top_c_imag_s, top_rho,
-                           bc_top_type, true, C(1.0), f_top, g_top);
-      delta_p[m] = f * g_top - g * f_top;
+    C f_top, g_top;
+    bc_impedance_complex(x, omega2, top_cp, top_c_imag_p, top_cs, top_c_imag_s,
+                         top_rho, bc_top_type, true, C(1.0), f_top, g_top);
+    delta_p[m] = f * g_top - g * f_top;
   }
   return delta_out;
 }
 
 // Single-x wrapper for scalar dispersion_complex (avoids tensor overhead)
 c10::complex<double> dispersion_complex_scalar_cpp(
-    c10::complex<double> x,
-    torch::Tensor B1,
-    torch::Tensor layer_loc,
-    torch::Tensor layer_n,
-    torch::Tensor layer_h,
-    torch::Tensor layer_rho,
-    double omega2,
-    int64_t bc_bot_type, double bot_cp, double bot_c_imag_p,
-    double bot_cs, double bot_c_imag_s, double bot_rho,
-    int64_t bc_top_type, double top_cp, double top_c_imag_p,
-    double top_cs, double top_c_imag_s, double top_rho,
-    double branch_sign
-) {
+    c10::complex<double> x, torch::Tensor B1, torch::Tensor layer_loc,
+    torch::Tensor layer_n, torch::Tensor layer_h, torch::Tensor layer_rho,
+    double omega2, int64_t bc_bot_type, double bot_cp, double bot_c_imag_p,
+    double bot_cs, double bot_c_imag_s, double bot_rho, int64_t bc_top_type,
+    double top_cp, double top_c_imag_p, double top_cs, double top_c_imag_s,
+    double top_rho, double branch_sign) {
   using C = c10::complex<double>;
   const int64_t n_layers = layer_loc.size(0);
   const double *RESTRICT b1 = B1.data_ptr<double>();
@@ -1368,9 +1447,8 @@ c10::complex<double> dispersion_complex_scalar_cpp(
 
   C bsign(branch_sign, 0.0);
   C f, g;
-  bc_impedance_complex(x, omega2, bot_cp, bot_c_imag_p,
-                       bot_cs, bot_c_imag_s, bot_rho,
-                       bc_bot_type, false, bsign, f, g);
+  bc_impedance_complex(x, omega2, bot_cp, bot_c_imag_p, bot_cs, bot_c_imag_s,
+                       bot_rho, bc_bot_type, false, bsign, f, g);
 
   for (int64_t li = n_layers - 1; li >= 0; --li) {
     double h = lh[li];
@@ -1395,9 +1473,8 @@ c10::complex<double> dispersion_complex_scalar_cpp(
   }
 
   C f_top, g_top;
-  bc_impedance_complex(x, omega2, top_cp, top_c_imag_p,
-                       top_cs, top_c_imag_s, top_rho,
-                       bc_top_type, true, C(1.0), f_top, g_top);
+  bc_impedance_complex(x, omega2, top_cp, top_c_imag_p, top_cs, top_c_imag_s,
+                       top_rho, bc_top_type, true, C(1.0), f_top, g_top);
   return f * g_top - g * f_top;
 }
 
@@ -1408,15 +1485,17 @@ struct DispEnv {
   const double *b2 = nullptr;
   const double *b3 = nullptr;
   const double *b4 = nullptr;
-  const double *rho_full = nullptr;  // per-point rho (full mesh, not per-layer)
+  const double *rho_full = nullptr; // per-point rho (full mesh, not per-layer)
   int64_t n_layers;
   const int64_t *ll;
   const int64_t *ln;
   const double *lh;
   const double *lr;
   double omega2;
-  int64_t bc_bot_type; double bot_cp, bot_ci, bot_cs, bot_csi, bot_rho;
-  int64_t bc_top_type; double top_cp, top_ci, top_cs, top_csi, top_rho;
+  int64_t bc_bot_type;
+  double bot_cp, bot_ci, bot_cs, bot_csi, bot_rho;
+  int64_t bc_top_type;
+  double top_cp, top_ci, top_cs, top_csi, top_rho;
 };
 
 // ---------------------------------------------------------------------------
@@ -1427,9 +1506,9 @@ struct DispEnv {
 // ---------------------------------------------------------------------------
 static void elastic_compound_propagate_complex(
     const double *b1, const double *b2, const double *b3, const double *b4,
-    const double *rho_arr, c10::complex<double> x,
-    c10::complex<double> yC[5], double h, int64_t n_steps,
-    int64_t loc_start, bool going_up, int64_t &iPower) {
+    const double *rho_arr, c10::complex<double> x, c10::complex<double> yC[5],
+    double h, int64_t n_steps, int64_t loc_start, bool going_up,
+    int64_t &iPower) {
   using C = c10::complex<double>;
 
   double two_h = 2.0 * h;
@@ -1443,8 +1522,10 @@ static void elastic_compound_propagate_complex(
   zC[0] = yC[0] - C(0.5) * (C(b1[j]) * yC[3] - C(b2[j]) * yC[4]);
   zC[1] = yC[1] - C(0.5) * (-C(rho_arr[j]) * yC[3] - xB3 * yC[4]);
   zC[2] = yC[2] - C(0.5) * (C(two_h) * yC[3] + C(b4[j]) * yC[4]);
-  zC[3] = yC[3] - C(0.5) * (xB3 * yC[0] + C(b2[j]) * yC[1] - two_x * C(b4[j]) * yC[2]);
-  zC[4] = yC[4] - C(0.5) * (C(rho_arr[j]) * yC[0] - C(b1[j]) * yC[1] - four_h_x * yC[2]);
+  zC[3] = yC[3] -
+          C(0.5) * (xB3 * yC[0] + C(b2[j]) * yC[1] - two_x * C(b4[j]) * yC[2]);
+  zC[4] = yC[4] - C(0.5) * (C(rho_arr[j]) * yC[0] - C(b1[j]) * yC[1] -
+                            four_h_x * yC[2]);
 
   for (int64_t step = 0; step < n_steps; ++step) {
     if (going_up)
@@ -1454,9 +1535,12 @@ static void elastic_compound_propagate_complex(
 
     // Swap y ↔ z
     C tmpC[5];
-    for (int i = 0; i < 5; ++i) tmpC[i] = yC[i];
-    for (int i = 0; i < 5; ++i) yC[i] = zC[i];
-    for (int i = 0; i < 5; ++i) zC[i] = tmpC[i];
+    for (int i = 0; i < 5; ++i)
+      tmpC[i] = yC[i];
+    for (int i = 0; i < 5; ++i)
+      yC[i] = zC[i];
+    for (int i = 0; i < 5; ++i)
+      zC[i] = tmpC[i];
 
     xB3 = x * C(b3[j]) - C(rho_arr[j]);
 
@@ -1470,33 +1554,41 @@ static void elastic_compound_propagate_complex(
     if (step < n_steps - 1) {
       double scale_val = std::abs(zC[1].real());
       if (scale_val < FLOOR_V) {
-        for (int i = 0; i < 5; ++i) { zC[i] *= C(ROOF_V); yC[i] *= C(ROOF_V); }
+        for (int i = 0; i < 5; ++i) {
+          zC[i] *= C(ROOF_V);
+          yC[i] *= C(ROOF_V);
+        }
         iPower -= IPOWER_R_V;
       } else if (scale_val > ROOF_V) {
-        for (int i = 0; i < 5; ++i) { zC[i] *= C(FLOOR_V); yC[i] *= C(FLOOR_V); }
+        for (int i = 0; i < 5; ++i) {
+          zC[i] *= C(FLOOR_V);
+          yC[i] *= C(FLOOR_V);
+        }
         iPower += IPOWER_R_V;
       }
     }
   }
 
   // Output is zC
-  for (int i = 0; i < 5; ++i) yC[i] = zC[i];
+  for (int i = 0; i < 5; ++i)
+    yC[i] = zC[i];
 }
 
 // Batched dispersion: evaluate disp(x[k], sign[k]) for k=0..K-1 in one
 // mesh sweep. Reads B1 once; updates K modes per mesh point.
 // If E.b3 is non-null, elastic layers (b3[loc_s] != 0) are propagated via
 // the complex compound-matrix formulation instead of acoustic recurrence.
-static void disp_eval_batch(
-    const c10::complex<double> *x, const double *bsigns,
-    int64_t K, const DispEnv &E, c10::complex<double> *out) {
+static void disp_eval_batch(const c10::complex<double> *x, const double *bsigns,
+                            int64_t K, const DispEnv &E,
+                            c10::complex<double> *out) {
   using C = c10::complex<double>;
   // Per-mode state: f[K], g[K]
   std::vector<C> f(K), g(K);
   for (int64_t k = 0; k < K; ++k) {
     C bs(bsigns[k], 0.0);
-    bc_impedance_complex(x[k], E.omega2, E.bot_cp, E.bot_ci, E.bot_cs, E.bot_csi,
-                         E.bot_rho, E.bc_bot_type, false, bs, f[k], g[k]);
+    bc_impedance_complex(x[k], E.omega2, E.bot_cp, E.bot_ci, E.bot_cs,
+                         E.bot_csi, E.bot_rho, E.bc_bot_type, false, bs, f[k],
+                         g[k]);
   }
   for (int64_t li = E.n_layers - 1; li >= 0; --li) {
     double h = E.lh[li];
@@ -1509,14 +1601,14 @@ static void disp_eval_batch(
       // Elastic compound-matrix propagation (going_up = true, sweeping bot→top)
       int64_t n_steps = E.ln[li] - 1;
       for (int64_t k = 0; k < K; ++k) {
-        // Build initial 5-vector from (f[k], g[k]) at acoustic/elastic interface.
-        // Convention: g = yV[1], f = omega2 * yV[3]
-        // For yV[0], yV[2], yV[4]: set to zero (consistent with Porter boundary init).
+        // Build initial 5-vector from (f[k], g[k]) at acoustic/elastic
+        // interface. Convention: g = yV[1], f = omega2 * yV[3] For yV[0],
+        // yV[2], yV[4]: set to zero (consistent with Porter boundary init).
         C yC[5] = {C(0.0), g[k], C(0.0), f[k] / C(E.omega2), C(0.0)};
         int64_t iPow = 0;
-        elastic_compound_propagate_complex(
-            E.b1, E.b2, E.b3, E.b4, E.rho_full, x[k], yC,
-            h, n_steps, loc_s, /*going_up=*/true, iPow);
+        elastic_compound_propagate_complex(E.b1, E.b2, E.b3, E.b4, E.rho_full,
+                                           x[k], yC, h, n_steps, loc_s,
+                                           /*going_up=*/true, iPow);
         // Convert back: f = omega2 * yV[3], g = yV[1]
         f[k] = C(E.omega2) * yC[3];
         g[k] = yC[1];
@@ -1530,16 +1622,17 @@ static void disp_eval_batch(
       for (int64_t k = 0; k < K; ++k) {
         C h2k2 = h * h * x[k];
         p1[k] = C(-2.0) * g[k];
-        p2[k] = (C(E.b1[loc_e]) - h2k2) * g[k] - C(2.0*h) * f[k] * C(rho);
+        p2[k] = (C(E.b1[loc_e]) - h2k2) * g[k] - C(2.0 * h) * f[k] * C(rho);
         p0[k] = p1[k];
       }
 
       // Sweep mesh: one B1 read per step, K mode updates
       for (int64_t s = 0; s < sweep_len; ++s) {
-        double b1_val = E.b1[(loc_e-1) - s];
+        double b1_val = E.b1[(loc_e - 1) - s];
         for (int64_t k = 0; k < K; ++k) {
           C h2k2 = h * h * x[k];
-          p0[k] = p1[k]; p1[k] = p2[k];
+          p0[k] = p1[k];
+          p1[k] = p2[k];
           p2[k] = (h2k2 - C(b1_val)) * p1[k] - p0[k];
         }
       }
@@ -1552,14 +1645,15 @@ static void disp_eval_batch(
   }
   for (int64_t k = 0; k < K; ++k) {
     C ft, gt;
-    bc_impedance_complex(x[k], E.omega2, E.top_cp, E.top_ci, E.top_cs, E.top_csi,
-                         E.top_rho, E.bc_top_type, true, C(1.0), ft, gt);
-    out[k] = f[k]*gt - g[k]*ft;
+    bc_impedance_complex(x[k], E.omega2, E.top_cp, E.top_ci, E.top_cs,
+                         E.top_csi, E.top_rho, E.bc_top_type, true, C(1.0), ft,
+                         gt);
+    out[k] = f[k] * gt - g[k] * ft;
   }
 }
 
-static inline c10::complex<double> disp_eval(
-    c10::complex<double> x, const DispEnv &E, double branch_sign) {
+static inline c10::complex<double>
+disp_eval(c10::complex<double> x, const DispEnv &E, double branch_sign) {
   using C = c10::complex<double>;
   C bsign(branch_sign, 0.0);
   C f, g;
@@ -1574,41 +1668,41 @@ static inline c10::complex<double> disp_eval(
       int64_t n_steps = E.ln[li] - 1;
       C yC[5] = {C(0.0), g, C(0.0), f / C(E.omega2), C(0.0)};
       int64_t iPow = 0;
-      elastic_compound_propagate_complex(
-          E.b1, E.b2, E.b3, E.b4, E.rho_full, x, yC,
-          h, n_steps, loc_s, /*going_up=*/true, iPow);
+      elastic_compound_propagate_complex(E.b1, E.b2, E.b3, E.b4, E.rho_full, x,
+                                         yC, h, n_steps, loc_s,
+                                         /*going_up=*/true, iPow);
       f = C(E.omega2) * yC[3];
       g = yC[1];
     } else {
       double rho = E.lr[li];
       C h2k2 = h * h * x;
-      C p1 = C(-2.0)*g, p2 = (C(E.b1[loc_e])-h2k2)*g - C(2.0*h)*f*C(rho), p0 = p1;
-      for (int64_t s = 0; s < loc_e-1-loc_s+1; ++s) {
-        p0=p1; p1=p2; p2 = (h2k2-C(E.b1[(loc_e-1)-s]))*p1-p0;
+      C p1 = C(-2.0) * g,
+        p2 = (C(E.b1[loc_e]) - h2k2) * g - C(2.0 * h) * f * C(rho), p0 = p1;
+      for (int64_t s = 0; s < loc_e - 1 - loc_s + 1; ++s) {
+        p0 = p1;
+        p1 = p2;
+        p2 = (h2k2 - C(E.b1[(loc_e - 1) - s])) * p1 - p0;
       }
-      f = -(p2-p0)/C(2.0*h*rho); g = -p1;
+      f = -(p2 - p0) / C(2.0 * h * rho);
+      g = -p1;
     }
   }
   C ft, gt;
   bc_impedance_complex(x, E.omega2, E.top_cp, E.top_ci, E.top_cs, E.top_csi,
                        E.top_rho, E.bc_top_type, true, C(1.0), ft, gt);
-  return f*gt - g*ft;
+  return f * gt - g * ft;
 }
 
 // Refine M roots: secant + polish + branch selection, all in C++
 std::tuple<torch::Tensor, torch::Tensor> refine_roots_cpp(
-    torch::Tensor x_init_t,    // [M] complex128 — initial guesses from real KRAKEN
-    torch::Tensor k_init_t,    // [M] complex128 — initial k from real KRAKEN
-    torch::Tensor B1,
-    torch::Tensor layer_loc, torch::Tensor layer_n,
-    torch::Tensor layer_h, torch::Tensor layer_rho,
-    double omega2,
-    int64_t bc_bot_type, double bot_cp, double bot_ci,
-    double bot_cs, double bot_csi, double bot_rho,
-    int64_t bc_top_type, double top_cp, double top_ci,
-    double top_cs, double top_csi, double top_rho,
-    double real_k_min, int64_t max_iter
-) {
+    torch::Tensor x_init_t, // [M] complex128 — initial guesses from real KRAKEN
+    torch::Tensor k_init_t, // [M] complex128 — initial k from real KRAKEN
+    torch::Tensor B1, torch::Tensor layer_loc, torch::Tensor layer_n,
+    torch::Tensor layer_h, torch::Tensor layer_rho, double omega2,
+    int64_t bc_bot_type, double bot_cp, double bot_ci, double bot_cs,
+    double bot_csi, double bot_rho, int64_t bc_top_type, double top_cp,
+    double top_ci, double top_cs, double top_csi, double top_rho,
+    double real_k_min, int64_t max_iter) {
   using C = c10::complex<double>;
   const int64_t M = x_init_t.size(0);
 
@@ -1620,121 +1714,162 @@ std::tuple<torch::Tensor, torch::Tensor> refine_roots_cpp(
   E.lh = layer_h.data_ptr<double>();
   E.lr = layer_rho.data_ptr<double>();
   E.omega2 = omega2;
-  E.bc_bot_type = bc_bot_type; E.bot_cp = bot_cp; E.bot_ci = bot_ci;
-  E.bot_cs = bot_cs; E.bot_csi = bot_csi; E.bot_rho = bot_rho;
-  E.bc_top_type = bc_top_type; E.top_cp = top_cp; E.top_ci = top_ci;
-  E.top_cs = top_cs; E.top_csi = top_csi; E.top_rho = top_rho;
+  E.bc_bot_type = bc_bot_type;
+  E.bot_cp = bot_cp;
+  E.bot_ci = bot_ci;
+  E.bot_cs = bot_cs;
+  E.bot_csi = bot_csi;
+  E.bot_rho = bot_rho;
+  E.bc_top_type = bc_top_type;
+  E.top_cp = top_cp;
+  E.top_ci = top_ci;
+  E.top_cs = top_cs;
+  E.top_csi = top_csi;
+  E.top_rho = top_rho;
 
-  const C *xi = reinterpret_cast<const C*>(x_init_t.data_ptr());
-  const C *ki = reinterpret_cast<const C*>(k_init_t.data_ptr());
+  const C *xi = reinterpret_cast<const C *>(x_init_t.data_ptr());
+  const C *ki = reinterpret_cast<const C *>(k_init_t.data_ptr());
 
   auto x_out = torch::empty({M}, torch::dtype(torch::kComplexDouble));
   auto signs_out = torch::empty({M}, torch::dtype(torch::kDouble));
-  C *xo = reinterpret_cast<C*>(x_out.data_ptr());
+  C *xo = reinterpret_cast<C *>(x_out.data_ptr());
   double *so = signs_out.data_ptr<double>();
 
   // Determine branch signs for all modes (batch: 2 dispersion calls per mode)
   // Then refine each mode independently
   for (int64_t m = 0; m < M; ++m) {
-      C x0 = xi[m];
-      C k_init = ki[m];
+    C x0 = xi[m];
+    C k_init = ki[m];
 
-      // Branch sign selection
-      double resid_pos = std::abs(disp_eval(x0, E, 1.0));
-      double resid_neg = std::abs(disp_eval(x0, E, -1.0));
-      double default_sign = (resid_neg < resid_pos) ? -1.0 : 1.0;
+    // Branch sign selection
+    double resid_pos = std::abs(disp_eval(x0, E, 1.0));
+    double resid_neg = std::abs(disp_eval(x0, E, -1.0));
+    double default_sign = (resid_neg < resid_pos) ? -1.0 : 1.0;
 
-      // Refine with both branches, pick best
-      auto do_refine = [&](double bsign) -> C {
-        C x_a = x0;
-        double sc = std::max(std::abs(x_a), 1.0);
-        C x_b = x_a * C(1.0+1e-8, 1e-8) + C(0.0, 1e-10*sc);
-        C f_a = disp_eval(x_a, E, bsign);
-        C f_b = disp_eval(x_b, E, bsign);
-        C best = x_a;
-        double best_r = std::abs(f_a);
-        if (std::abs(f_b) < best_r) { best = x_b; best_r = std::abs(f_b); }
+    // Refine with both branches, pick best
+    auto do_refine = [&](double bsign) -> C {
+      C x_a = x0;
+      double sc = std::max(std::abs(x_a), 1.0);
+      C x_b = x_a * C(1.0 + 1e-8, 1e-8) + C(0.0, 1e-10 * sc);
+      C f_a = disp_eval(x_a, E, bsign);
+      C f_b = disp_eval(x_b, E, bsign);
+      C best = x_a;
+      double best_r = std::abs(f_a);
+      if (std::abs(f_b) < best_r) {
+        best = x_b;
+        best_r = std::abs(f_b);
+      }
 
-        for (int64_t it = 0; it < max_iter; ++it) {
-          C denom = f_b - f_a;
-          if (std::abs(denom) < 1e-20) break;
-          C x_c = x_b - f_b * (x_b - x_a) / denom;
-          if (!std::isfinite(x_c.real()) || !std::isfinite(x_c.imag())) break;
-          if (x_c.real() <= 0.0) break;
-          C f_c = disp_eval(x_c, E, bsign);
-          if (std::abs(f_c) < best_r) { best = x_c; best_r = std::abs(f_c); }
-          if (std::abs(x_c - x_b) <= 1e-12 * (1.0 + std::abs(x_c))) return best;
-          x_a = x_b; f_a = f_b; x_b = x_c; f_b = f_c;
-          if (std::abs(f_b) <= 1e-10 * sc) return best;
+      for (int64_t it = 0; it < max_iter; ++it) {
+        C denom = f_b - f_a;
+        if (std::abs(denom) < 1e-20)
+          break;
+        C x_c = x_b - f_b * (x_b - x_a) / denom;
+        if (!std::isfinite(x_c.real()) || !std::isfinite(x_c.imag()))
+          break;
+        if (x_c.real() <= 0.0)
+          break;
+        C f_c = disp_eval(x_c, E, bsign);
+        if (std::abs(f_c) < best_r) {
+          best = x_c;
+          best_r = std::abs(f_c);
         }
+        if (std::abs(x_c - x_b) <= 1e-12 * (1.0 + std::abs(x_c)))
+          return best;
+        x_a = x_b;
+        f_a = f_b;
+        x_b = x_c;
+        f_b = f_c;
+        if (std::abs(f_b) <= 1e-10 * sc)
+          return best;
+      }
 
-        // Polish with Newton (8 iterations)
-        C xp = best;
-        double bp = best_r;
-        for (int i = 0; i < 8; ++i) {
-          double sloc = std::max(std::abs(xp), 1.0);
-          C h(1e-8*sloc, 1e-8*sloc);
-          C fc = disp_eval(xp, E, bsign);
-          C fp = disp_eval(xp+h, E, bsign);
-          C fm = disp_eval(xp-h, E, bsign);
-          C dfdx = (fp-fm)/(C(2.0)*h);
-          if (std::abs(dfdx) < 1e-20) break;
-          C xn = xp - fc/dfdx;
-          if (!std::isfinite(xn.real()) || !std::isfinite(xn.imag())) break;
-          if (xn.real() <= 0.0 || std::sqrt(xn.real()) < real_k_min) break;
-          C fn = disp_eval(xn, E, bsign);
-          if (std::abs(fn) < bp) { xp = xn; bp = std::abs(fn); }
-          else xp = xn;  // continue Newton anyway
-        }
-        if (bp < best_r) best = xp;
-        return best;
-      };
+      // Polish with Newton (8 iterations)
+      C xp = best;
+      double bp = best_r;
+      for (int i = 0; i < 8; ++i) {
+        double sloc = std::max(std::abs(xp), 1.0);
+        C h(1e-8 * sloc, 1e-8 * sloc);
+        C fc = disp_eval(xp, E, bsign);
+        C fp = disp_eval(xp + h, E, bsign);
+        C fm = disp_eval(xp - h, E, bsign);
+        C dfdx = (fp - fm) / (C(2.0) * h);
+        if (std::abs(dfdx) < 1e-20)
+          break;
+        C xn = xp - fc / dfdx;
+        if (!std::isfinite(xn.real()) || !std::isfinite(xn.imag()))
+          break;
+        if (xn.real() <= 0.0 || std::sqrt(xn.real()) < real_k_min)
+          break;
+        C fn = disp_eval(xn, E, bsign);
+        if (std::abs(fn) < bp) {
+          xp = xn;
+          bp = std::abs(fn);
+        } else
+          xp = xn; // continue Newton anyway
+      }
+      if (bp < best_r)
+        best = xp;
+      return best;
+    };
 
-      C x_def = do_refine(default_sign);
-      C x_alt = do_refine(-default_sign);
+    C x_def = do_refine(default_sign);
+    C x_alt = do_refine(-default_sign);
 
-      // Candidate scoring: 4 candidates (default±conj, alt±conj)
-      struct Cand { double sign; C x; C k; };
-      auto make_k = [](C x) -> C {
-        C k = std::sqrt(x); return k.real() < 0 ? -k : k;
-      };
-      Cand cands[4] = {
+    // Candidate scoring: 4 candidates (default±conj, alt±conj)
+    struct Cand {
+      double sign;
+      C x;
+      C k;
+    };
+    auto make_k = [](C x) -> C {
+      C k = std::sqrt(x);
+      return k.real() < 0 ? -k : k;
+    };
+    Cand cands[4] = {
         {default_sign, x_def, make_k(x_def)},
         {default_sign, std::conj(x_def), make_k(std::conj(x_def))},
         {-default_sign, x_alt, make_k(x_alt)},
         {-default_sign, std::conj(x_alt), make_k(std::conj(x_alt))},
-      };
+    };
 
-      auto score = [&](const Cand &c) -> std::tuple<int,double,double> {
-        double r = std::abs(disp_eval(c.x, E, c.sign));
-        int pos_imag = c.k.imag() > 1e-12 ? 1 : 0;
-        return {pos_imag, r, std::abs(c.k - k_init)};
-      };
+    auto score = [&](const Cand &c) -> std::tuple<int, double, double> {
+      double r = std::abs(disp_eval(c.x, E, c.sign));
+      int pos_imag = c.k.imag() > 1e-12 ? 1 : 0;
+      return {pos_imag, r, std::abs(c.k - k_init)};
+    };
 
-      int best_idx = 0;
-      auto best_score = score(cands[0]);
-      for (int i = 1; i < 4; ++i) {
-        auto s = score(cands[i]);
-        if (s < best_score) { best_score = s; best_idx = i; }
+    int best_idx = 0;
+    auto best_score = score(cands[0]);
+    for (int i = 1; i < 4; ++i) {
+      auto s = score(cands[i]);
+      if (s < best_score) {
+        best_score = s;
+        best_idx = i;
       }
+    }
 
-      C k_best = cands[best_idx].k;
-      C x_best = cands[best_idx].x;
-      double sign_best = cands[best_idx].sign;
+    C k_best = cands[best_idx].k;
+    C x_best = cands[best_idx].x;
+    double sign_best = cands[best_idx].sign;
 
-      // Guard: near real axis → keep perturbative
-      if (std::abs(k_best.imag()) < std::max(1e-8, 1e-2*std::abs(k_init.imag()))) {
-        x_best = x0; k_best = k_init;
-      }
-      if (k_best.real() <= 0.0 || k_best.real() < real_k_min) {
-        x_best = x0; k_best = k_init;
-      }
-      if (k_best.imag() > 0.0 && std::abs(k_best.imag()) < 1e-6) {
-        x_best = x0; k_best = k_init;
-      }
+    // Guard: near real axis → keep perturbative
+    if (std::abs(k_best.imag()) <
+        std::max(1e-8, 1e-2 * std::abs(k_init.imag()))) {
+      x_best = x0;
+      k_best = k_init;
+    }
+    if (k_best.real() <= 0.0 || k_best.real() < real_k_min) {
+      x_best = x0;
+      k_best = k_init;
+    }
+    if (k_best.imag() > 0.0 && std::abs(k_best.imag()) < 1e-6) {
+      x_best = x0;
+      k_best = k_init;
+    }
 
-      xo[m] = x_best;
-      so[m] = sign_best;
+    xo[m] = x_best;
+    so[m] = sign_best;
   }
 
   return std::make_tuple(x_out, signs_out);
@@ -1746,10 +1881,12 @@ std::tuple<torch::Tensor, torch::Tensor> refine_roots_cpp(
 // leapfrog scheme with iPower normalization on yV[1].
 // ---------------------------------------------------------------------------
 
-static void elastic_compound_propagate(
-    const double *b1, const double *b2, const double *b3, const double *b4,
-    const double *rho_arr, double x, double yV[5], double h, int64_t n_steps,
-    int64_t loc_start, bool going_up, int64_t &iPower) {
+static void elastic_compound_propagate(const double *b1, const double *b2,
+                                       const double *b3, const double *b4,
+                                       const double *rho_arr, double x,
+                                       double yV[5], double h, int64_t n_steps,
+                                       int64_t loc_start, bool going_up,
+                                       int64_t &iPower) {
 
   double two_x = 2.0 * x;
   double two_h = 2.0 * h;
@@ -1774,9 +1911,12 @@ static void elastic_compound_propagate(
 
     // Swap: y_old = y; y = z; z = y_old
     double tmp[5];
-    for (int i = 0; i < 5; ++i) tmp[i] = yV[i];
-    for (int i = 0; i < 5; ++i) yV[i] = z[i];
-    for (int i = 0; i < 5; ++i) z[i] = tmp[i];
+    for (int i = 0; i < 5; ++i)
+      tmp[i] = yV[i];
+    for (int i = 0; i < 5; ++i)
+      yV[i] = z[i];
+    for (int i = 0; i < 5; ++i)
+      z[i] = tmp[i];
 
     xB3 = x * b3[j] - rho_arr[j];
 
@@ -1790,20 +1930,28 @@ static void elastic_compound_propagate(
     if (step < n_steps - 1) {
       double scale_val = std::abs(z[1]);
       if (scale_val < FLOOR_V) {
-        for (int i = 0; i < 5; ++i) { z[i] *= ROOF_V; yV[i] *= ROOF_V; }
+        for (int i = 0; i < 5; ++i) {
+          z[i] *= ROOF_V;
+          yV[i] *= ROOF_V;
+        }
         iPower -= IPOWER_R_V;
       } else if (scale_val > ROOF_V) {
-        for (int i = 0; i < 5; ++i) { z[i] *= FLOOR_V; yV[i] *= FLOOR_V; }
+        for (int i = 0; i < 5; ++i) {
+          z[i] *= FLOOR_V;
+          yV[i] *= FLOOR_V;
+        }
         iPower += IPOWER_R_V;
       }
     }
   }
 
   // Output is z (the "newest" value)
-  for (int i = 0; i < 5; ++i) yV[i] = z[i];
+  for (int i = 0; i < 5; ++i)
+    yV[i] = z[i];
 }
 
-// Full elastic dispersion evaluation: BC -> elastic layers -> acoustic recurrence -> match
+// Full elastic dispersion evaluation: BC -> elastic layers -> acoustic
+// recurrence -> match
 static DispResult dispersion_elastic_eval(
     double x, const double *b1, const double *b2, const double *b3,
     const double *b4, const double *rho_full, int64_t n_layers,
@@ -1836,12 +1984,15 @@ static DispResult dispersion_elastic_eval(
 
     for (int64_t med = n_layers - 1; med > last_acoustic; --med) {
       int64_t ns = layer_n[med] - 1;
-      elastic_compound_propagate(b1, b2, b3, b4, rho_full, x, yV,
-                                 layer_h[med], ns, layer_loc[med], true, iPower);
+      elastic_compound_propagate(b1, b2, b3, b4, rho_full, x, yV, layer_h[med],
+                                 ns, layer_loc[med], true, iPower);
     }
     f = omega2 * yV[3];
     g = yV[1];
-    if (g > 0.0) mc = 1; else mc = 0;
+    if (g > 0.0)
+      mc = 1;
+    else
+      mc = 0;
   }
 
   // Acoustic recurrence through acoustic layers
@@ -1879,11 +2030,17 @@ static DispResult dispersion_elastic_eval(
     // Build yV from top BC
     double yV_top[5];
     if (bc_top.type == 0) { // vacuum
-      yV_top[0] = 1.0; yV_top[1] = 0.0; yV_top[2] = 0.0;
-      yV_top[3] = 0.0; yV_top[4] = 0.0;
+      yV_top[0] = 1.0;
+      yV_top[1] = 0.0;
+      yV_top[2] = 0.0;
+      yV_top[3] = 0.0;
+      yV_top[4] = 0.0;
     } else if (bc_top.type == 1) { // rigid
-      yV_top[0] = 0.0; yV_top[1] = -1.0; yV_top[2] = 0.0;
-      yV_top[3] = 0.0; yV_top[4] = 0.0;
+      yV_top[0] = 0.0;
+      yV_top[1] = -1.0;
+      yV_top[2] = 0.0;
+      yV_top[3] = 0.0;
+      yV_top[4] = 0.0;
     } else {
       // Reconstruct full yV from half-space BC
       double gS2 = x - omega2 / (bc_top.cs * bc_top.cs);
@@ -1902,11 +2059,12 @@ static DispResult dispersion_elastic_eval(
     for (int64_t med = 0; med < first_acoustic; ++med) {
       int64_t ns = layer_n[med] - 1;
       elastic_compound_propagate(b1, b2, b3, b4, rho_full, x, yV_top,
-                                 layer_h[med], ns, layer_loc[med], false, ip_top);
+                                 layer_h[med], ns, layer_loc[med], false,
+                                 ip_top);
     }
 
     f_top = omega2 * yV_top[3];
-    g_top = -yV_top[1];  // negate for top BC convention
+    g_top = -yV_top[1]; // negate for top BC convention
     iPower += ip_top;
   } else {
     bc_impedance(x, omega2, bc_top, true, f_top, g_top, ip_top, mc_top);
@@ -1951,8 +2109,8 @@ torch::Tensor elastic_solve1_cpp(
 
   for (int64_t i = 0; i < n_grid; ++i) {
     double xi = x_min + i * dx;
-    auto r = dispersion_elastic_eval(xi, b1, b2, b3, b4, rho_f, n_layers,
-                                     lloc, ln, lh, lrho, omega2, bc_bot, bc_top,
+    auto r = dispersion_elastic_eval(xi, b1, b2, b3, b4, rho_f, n_layers, lloc,
+                                     ln, lh, lrho, omega2, bc_bot, bc_top,
                                      first_acoustic, last_acoustic);
     delta_signs[i] = r.Delta > 0 ? 1.0 : (r.Delta < 0 ? -1.0 : 0.0);
   }
@@ -1969,9 +2127,9 @@ torch::Tensor elastic_solve1_cpp(
 
       for (int iter = 0; iter < 60; ++iter) {
         double c = 0.5 * (a + b);
-        auto rc = dispersion_elastic_eval(c, b1, b2, b3, b4, rho_f, n_layers,
-                                          lloc, ln, lh, lrho, omega2, bc_bot,
-                                          bc_top, first_acoustic, last_acoustic);
+        auto rc = dispersion_elastic_eval(
+            c, b1, b2, b3, b4, rho_f, n_layers, lloc, ln, lh, lrho, omega2,
+            bc_bot, bc_top, first_acoustic, last_acoustic);
         double sc = rc.Delta > 0 ? 1.0 : (rc.Delta < 0 ? -1.0 : 0.0);
         if (sa * sc < 0) {
           b = c;
@@ -1983,7 +2141,8 @@ torch::Tensor elastic_solve1_cpp(
           break;
       }
       double root = 0.5 * (a + b);
-      if (roots.empty() || std::abs(root - roots.back()) > 1e-12 * std::abs(root)) {
+      if (roots.empty() ||
+          std::abs(root - roots.back()) > 1e-12 * std::abs(root)) {
         roots.push_back(root);
       }
     }
@@ -2002,21 +2161,18 @@ torch::Tensor elastic_solve1_cpp(
 // ---------------------------------------------------------------------------
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 krakenc_fused_cpp(
-    torch::Tensor x_init_t,     // [M] complex128 — real KRAKEN eigenvalues
-    torch::Tensor k_init_t,     // [M] complex128 — real KRAKEN wavenumbers
-    torch::Tensor B1,           // [N_total] float64
-    torch::Tensor B1C,          // [N_total] float64 (complex part)
-    torch::Tensor layer_loc,    // [n_ac_layers] int64
-    torch::Tensor layer_n,      // [n_ac_layers] int64
-    torch::Tensor layer_h,      // [n_ac_layers] float64
-    torch::Tensor layer_rho,    // [n_ac_layers] float64
-    double omega2,
-    int64_t bc_bot_type, double bot_cp, double bot_ci,
-    double bot_cs, double bot_csi, double bot_rho,
-    int64_t bc_top_type, double top_cp, double top_ci,
-    double top_cs, double top_csi, double top_rho,
-    double real_k_min, int64_t max_iter, int64_t n_inv_iter
-) {
+    torch::Tensor x_init_t,  // [M] complex128 — real KRAKEN eigenvalues
+    torch::Tensor k_init_t,  // [M] complex128 — real KRAKEN wavenumbers
+    torch::Tensor B1,        // [N_total] float64
+    torch::Tensor B1C,       // [N_total] float64 (complex part)
+    torch::Tensor layer_loc, // [n_ac_layers] int64
+    torch::Tensor layer_n,   // [n_ac_layers] int64
+    torch::Tensor layer_h,   // [n_ac_layers] float64
+    torch::Tensor layer_rho, // [n_ac_layers] float64
+    double omega2, int64_t bc_bot_type, double bot_cp, double bot_ci,
+    double bot_cs, double bot_csi, double bot_rho, int64_t bc_top_type,
+    double top_cp, double top_ci, double top_cs, double top_csi, double top_rho,
+    double real_k_min, int64_t max_iter, int64_t n_inv_iter) {
   using C = c10::complex<double>;
   const int64_t M = x_init_t.size(0);
   const int64_t n_layers = layer_loc.size(0);
@@ -2030,14 +2186,22 @@ krakenc_fused_cpp(
   E.lh = layer_h.data_ptr<double>();
   E.lr = layer_rho.data_ptr<double>();
   E.omega2 = omega2;
-  E.bc_bot_type = bc_bot_type; E.bot_cp = bot_cp; E.bot_ci = bot_ci;
-  E.bot_cs = bot_cs; E.bot_csi = bot_csi; E.bot_rho = bot_rho;
-  E.bc_top_type = bc_top_type; E.top_cp = top_cp; E.top_ci = top_ci;
-  E.top_cs = top_cs; E.top_csi = top_csi; E.top_rho = top_rho;
+  E.bc_bot_type = bc_bot_type;
+  E.bot_cp = bot_cp;
+  E.bot_ci = bot_ci;
+  E.bot_cs = bot_cs;
+  E.bot_csi = bot_csi;
+  E.bot_rho = bot_rho;
+  E.bc_top_type = bc_top_type;
+  E.top_cp = top_cp;
+  E.top_ci = top_ci;
+  E.top_cs = top_cs;
+  E.top_csi = top_csi;
+  E.top_rho = top_rho;
 
   // --- Step 2: Batched branch-sign check + selective refinement ---
-  const C *xi = reinterpret_cast<const C*>(x_init_t.data_ptr());
-  const C *ki = reinterpret_cast<const C*>(k_init_t.data_ptr());
+  const C *xi = reinterpret_cast<const C *>(x_init_t.data_ptr());
+  const C *ki = reinterpret_cast<const C *>(k_init_t.data_ptr());
 
   std::vector<C> x_refined(M);
   std::vector<double> signs(M);
@@ -2051,7 +2215,8 @@ krakenc_fused_cpp(
   refine_list.reserve(M);
   for (int64_t m = 0; m < M; ++m) {
     x0_all[m] = ki[m] * ki[m];
-    double k_imag_ratio = std::abs(ki[m].imag()) / std::max(1e-30, std::abs(ki[m].real()));
+    double k_imag_ratio =
+        std::abs(ki[m].imag()) / std::max(1e-30, std::abs(ki[m].real()));
     if (k_imag_ratio < 1e-10) {
       // Negligible attenuation — perturbative k is exact
       x_refined[m] = x0_all[m];
@@ -2103,7 +2268,7 @@ krakenc_fused_cpp(
       double best_r, bsign;
       bool done;
     };
-    std::vector<SecState> tracks(2 * K);  // [0..K) = default, [K..2K) = alt
+    std::vector<SecState> tracks(2 * K); // [0..K) = default, [K..2K) = alt
 
     // Initialize: x_a = x0, x_b = perturbed x0
     std::vector<C> eval_x(2 * K);
@@ -2112,13 +2277,15 @@ krakenc_fused_cpp(
       int64_t m = refine_list[i];
       C x0 = x0_all[m];
       double sc = std::max(std::abs(x0), 1.0);
-      C x_b = x0 * C(1.0+1e-8, 1e-8) + C(0.0, 1e-10*sc);
-      double ds = signs[m];  // default_sign from branch check
+      C x_b = x0 * C(1.0 + 1e-8, 1e-8) + C(0.0, 1e-10 * sc);
+      double ds = signs[m]; // default_sign from branch check
 
-      tracks[i]     = {x0, x_b, C(0), C(0), x0, 1e30, ds, false};
+      tracks[i] = {x0, x_b, C(0), C(0), x0, 1e30, ds, false};
       tracks[K + i] = {x0, x_b, C(0), C(0), x0, 1e30, -ds, false};
-      eval_x[i]     = x0;     eval_s[i]     = ds;
-      eval_x[K + i] = x0;     eval_s[K + i] = -ds;
+      eval_x[i] = x0;
+      eval_s[i] = ds;
+      eval_x[K + i] = x0;
+      eval_s[K + i] = -ds;
     }
 
     // Initial f_a evaluation (batched, one sweep for all 2K modes)
@@ -2130,7 +2297,8 @@ krakenc_fused_cpp(
     }
 
     // Initial f_b evaluation
-    for (int64_t i = 0; i < 2 * K; ++i) eval_x[i] = tracks[i].x_b;
+    for (int64_t i = 0; i < 2 * K; ++i)
+      eval_x[i] = tracks[i].x_b;
     disp_eval_batch(eval_x.data(), eval_s.data(), 2 * K, E, f_out.data());
     for (int64_t i = 0; i < 2 * K; ++i) {
       tracks[i].f_b = f_out[i];
@@ -2147,19 +2315,27 @@ krakenc_fused_cpp(
       std::vector<int64_t> active_idx;
       active_idx.reserve(2 * K);
       for (int64_t i = 0; i < 2 * K; ++i) {
-        if (tracks[i].done) continue;
+        if (tracks[i].done)
+          continue;
         C denom = tracks[i].f_b - tracks[i].f_a;
-        if (std::abs(denom) < 1e-20) { tracks[i].done = true; continue; }
-        C x_c = tracks[i].x_b - tracks[i].f_b * (tracks[i].x_b - tracks[i].x_a) / denom;
-        if (!std::isfinite(x_c.real()) || !std::isfinite(x_c.imag()) || x_c.real() <= 0.0) {
-          tracks[i].done = true; continue;
+        if (std::abs(denom) < 1e-20) {
+          tracks[i].done = true;
+          continue;
+        }
+        C x_c = tracks[i].x_b -
+                tracks[i].f_b * (tracks[i].x_b - tracks[i].x_a) / denom;
+        if (!std::isfinite(x_c.real()) || !std::isfinite(x_c.imag()) ||
+            x_c.real() <= 0.0) {
+          tracks[i].done = true;
+          continue;
         }
         eval_x[n_active] = x_c;
         eval_s[n_active] = tracks[i].bsign;
         active_idx.push_back(i);
         ++n_active;
       }
-      if (n_active == 0) break;
+      if (n_active == 0)
+        break;
 
       // Batched evaluation
       disp_eval_batch(eval_x.data(), eval_s.data(), n_active, E, f_out.data());
@@ -2168,24 +2344,37 @@ krakenc_fused_cpp(
         int64_t i = active_idx[j];
         C x_c = eval_x[j];
         C f_c = f_out[j];
-        if (std::abs(f_c) < tracks[i].best_r) { tracks[i].best = x_c; tracks[i].best_r = std::abs(f_c); }
-        if (std::abs(x_c - tracks[i].x_b) <= 1e-12 * (1.0 + std::abs(x_c))) tracks[i].done = true;
-        tracks[i].x_a = tracks[i].x_b; tracks[i].f_a = tracks[i].f_b;
-        tracks[i].x_b = x_c; tracks[i].f_b = f_c;
+        if (std::abs(f_c) < tracks[i].best_r) {
+          tracks[i].best = x_c;
+          tracks[i].best_r = std::abs(f_c);
+        }
+        if (std::abs(x_c - tracks[i].x_b) <= 1e-12 * (1.0 + std::abs(x_c)))
+          tracks[i].done = true;
+        tracks[i].x_a = tracks[i].x_b;
+        tracks[i].f_a = tracks[i].f_b;
+        tracks[i].x_b = x_c;
+        tracks[i].f_b = f_c;
       }
     }
 
     // Score 4 candidates per mode (batched)
-    auto make_k = [](C x) -> C { C k = std::sqrt(x); return k.real() < 0 ? -k : k; };
+    auto make_k = [](C x) -> C {
+      C k = std::sqrt(x);
+      return k.real() < 0 ? -k : k;
+    };
     std::vector<C> score_x(4 * K);
     std::vector<double> score_s(4 * K);
     for (int64_t i = 0; i < K; ++i) {
       C x_def = tracks[i].best, x_alt = tracks[K + i].best;
       double ds = tracks[i].bsign;
-      score_x[4*i+0] = x_def;             score_s[4*i+0] = ds;
-      score_x[4*i+1] = std::conj(x_def);  score_s[4*i+1] = ds;
-      score_x[4*i+2] = x_alt;             score_s[4*i+2] = -ds;
-      score_x[4*i+3] = std::conj(x_alt);  score_s[4*i+3] = -ds;
+      score_x[4 * i + 0] = x_def;
+      score_s[4 * i + 0] = ds;
+      score_x[4 * i + 1] = std::conj(x_def);
+      score_s[4 * i + 1] = ds;
+      score_x[4 * i + 2] = x_alt;
+      score_s[4 * i + 2] = -ds;
+      score_x[4 * i + 3] = std::conj(x_alt);
+      score_s[4 * i + 3] = -ds;
     }
     std::vector<C> score_d(4 * K);
     disp_eval_batch(score_x.data(), score_s.data(), 4 * K, E, score_d.data());
@@ -2195,29 +2384,37 @@ krakenc_fused_cpp(
       C k_init = ki[m];
 
       int best_idx = 0;
-      auto mk = [&](int j) -> std::tuple<int,double,double> {
-        C k = make_k(score_x[4*i+j]);
-        return {k.imag() > 1e-12 ? 1 : 0, std::abs(score_d[4*i+j]), std::abs(k - k_init)};
+      auto mk = [&](int j) -> std::tuple<int, double, double> {
+        C k = make_k(score_x[4 * i + j]);
+        return {k.imag() > 1e-12 ? 1 : 0, std::abs(score_d[4 * i + j]),
+                std::abs(k - k_init)};
       };
       auto best_sc = mk(0);
       for (int j = 1; j < 4; ++j) {
         auto s = mk(j);
-        if (s < best_sc) { best_sc = s; best_idx = j; }
+        if (s < best_sc) {
+          best_sc = s;
+          best_idx = j;
+        }
       }
 
-      C x_best = score_x[4*i + best_idx];
+      C x_best = score_x[4 * i + best_idx];
       C k_best = make_k(x_best);
-      double sign_best = score_s[4*i + best_idx];
+      double sign_best = score_s[4 * i + best_idx];
       C x0 = x0_all[m];
 
-      if (std::abs(k_best.imag()) < std::max(1e-8, 1e-2*std::abs(k_init.imag()))) {
-        x_best = x0; k_best = k_init;
+      if (std::abs(k_best.imag()) <
+          std::max(1e-8, 1e-2 * std::abs(k_init.imag()))) {
+        x_best = x0;
+        k_best = k_init;
       }
       if (k_best.real() <= 0.0 || k_best.real() < real_k_min) {
-        x_best = x0; k_best = k_init;
+        x_best = x0;
+        k_best = k_init;
       }
       if (k_best.imag() > 0.0 && std::abs(k_best.imag()) < 1e-6) {
-        x_best = x0; k_best = k_init;
+        x_best = x0;
+        k_best = k_init;
       }
       x_refined[m] = x_best;
       signs[m] = sign_best;
@@ -2254,7 +2451,8 @@ krakenc_fused_cpp(
         C b1_val = C(b1_ptr[loc + i]) + C(0.0, h * h) * C(b1c_ptr[loc + i]);
         base_d[j + i] = b1_val / h_rho;
         h2_fac[j + i] = C(xcoeff);
-        if (i > 0) e_vec[j + i] = C(inv_hrho);
+        if (i > 0)
+          e_vec[j + i] = C(inv_hrho);
       }
       j += n;
     } else {
@@ -2272,21 +2470,26 @@ krakenc_fused_cpp(
     }
   }
 
-  // --- Step 4: Compute BC ratios + inverse iteration (only for refined modes) ---
-  auto phi = torch::full({M, N_total1}, C(1e-10), torch::dtype(torch::kComplexDouble));
-  C *pp = reinterpret_cast<C*>(phi.data_ptr());
+  // --- Step 4: Compute BC ratios + inverse iteration (only for refined modes)
+  // ---
+  auto phi =
+      torch::full({M, N_total1}, C(1e-10), torch::dtype(torch::kComplexDouble));
+  C *pp = reinterpret_cast<C *>(phi.data_ptr());
 
   auto x_out = torch::empty({M}, torch::dtype(torch::kComplexDouble));
   auto signs_out = torch::empty({M}, torch::dtype(torch::kDouble));
-  // needs_phi[m] = 1 if mode m needs inverse iteration, 0 if perturbative (caller fills phi)
+  // needs_phi[m] = 1 if mode m needs inverse iteration, 0 if perturbative
+  // (caller fills phi)
   auto needs_phi_t = torch::zeros({M}, torch::dtype(torch::kBool));
   bool *needs_phi = needs_phi_t.data_ptr<bool>();
-  C *xo = reinterpret_cast<C*>(x_out.data_ptr());
+  C *xo = reinterpret_cast<C *>(x_out.data_ptr());
   double *so = signs_out.data_ptr<double>();
 
-  // Mark which modes were refined (need new phi) vs perturbative (reuse existing)
+  // Mark which modes were refined (need new phi) vs perturbative (reuse
+  // existing)
   for (int64_t m = 0; m < M; ++m) {
-    double k_imag_ratio = std::abs(ki[m].imag()) / std::max(1e-30, std::abs(ki[m].real()));
+    double k_imag_ratio =
+        std::abs(ki[m].imag()) / std::max(1e-30, std::abs(ki[m].real()));
     needs_phi[m] = (k_imag_ratio >= 1e-10);
   }
 
@@ -2297,7 +2500,8 @@ krakenc_fused_cpp(
     xo[m] = x_m;
     so[m] = signs[m];
 
-    if (!needs_phi[m]) continue;  // skip inverse iteration for perturbative modes
+    if (!needs_phi[m])
+      continue; // skip inverse iteration for perturbative modes
 
     // BC impedance for this mode
     C bsign(signs[m], 0.0);
@@ -2320,32 +2524,51 @@ krakenc_fused_cpp(
         dw[i] = base_d[i] - x_m * h2_fac[i];
 
       // BC injection
-      if (top_vac) dw[0] = C(1.0);
-      else         dw[0] = dw[0] / C(2.0) + top_ratio;
-      if (bot_vac) dw[N_total1-1] = C(1.0);
-      else         dw[N_total1-1] = dw[N_total1-1] / C(2.0) - bot_ratio;
+      if (top_vac)
+        dw[0] = C(1.0);
+      else
+        dw[0] = dw[0] / C(2.0) + top_ratio;
+      if (bot_vac)
+        dw[N_total1 - 1] = C(1.0);
+      else
+        dw[N_total1 - 1] = dw[N_total1 - 1] / C(2.0) - bot_ratio;
 
       // Thomas forward
       for (int64_t i = 1; i < N_total1; ++i) {
-        C w = e_vec[i] / dw[i-1];
+        C w = e_vec[i] / dw[i - 1];
         dw[i] -= w * e_vec[i];
-        pm[i] -= w * pm[i-1];
+        pm[i] -= w * pm[i - 1];
       }
-      pm[N_total1-1] /= dw[N_total1-1];
-      for (int64_t i = N_total1-2; i >= 0; --i)
-        pm[i] = (pm[i] - e_vec[i+1] * pm[i+1]) / dw[i];
+      pm[N_total1 - 1] /= dw[N_total1 - 1];
+      for (int64_t i = N_total1 - 2; i >= 0; --i)
+        pm[i] = (pm[i] - e_vec[i + 1] * pm[i + 1]) / dw[i];
 
       // Max-norm
       double mx = 0.0;
-      for (int64_t i = 0; i < N_total1; ++i) { double a = std::abs(pm[i]); if (a > mx) mx = a; }
-      if (mx > 0.0) { C inv(1.0/mx); for (int64_t i = 0; i < N_total1; ++i) pm[i] *= inv; }
+      for (int64_t i = 0; i < N_total1; ++i) {
+        double a = std::abs(pm[i]);
+        if (a > mx)
+          mx = a;
+      }
+      if (mx > 0.0) {
+        C inv(1.0 / mx);
+        for (int64_t i = 0; i < N_total1; ++i)
+          pm[i] *= inv;
+      }
     }
 
     // Final L2 norm
     double sq = 0.0;
-    for (int64_t i = 0; i < N_total1; ++i) { double a = std::abs(pm[i]); sq += a*a; }
+    for (int64_t i = 0; i < N_total1; ++i) {
+      double a = std::abs(pm[i]);
+      sq += a * a;
+    }
     double nrm = std::sqrt(sq);
-    if (nrm > 0.0) { C inv(1.0/nrm); for (int64_t i = 0; i < N_total1; ++i) pm[i] *= inv; }
+    if (nrm > 0.0) {
+      C inv(1.0 / nrm);
+      for (int64_t i = 0; i < N_total1; ++i)
+        pm[i] *= inv;
+    }
   }
 
   return std::make_tuple(x_out, signs_out, phi, needs_phi_t);
@@ -2359,28 +2582,31 @@ krakenc_fused_cpp(
 
 torch::Tensor field3d_gbt_cpp(
     // Mesh: nodes and connectivity
-    torch::Tensor node_x,       // [N_nodes] float64 — x coordinates (meters)
-    torch::Tensor node_y,       // [N_nodes] float64 — y coordinates
-    torch::Tensor elements,     // [N_elt, 3] int64 — 0-based node indices
-    torch::Tensor adjacency,    // [N_elt, 3] int64 — neighbor per side (-1 = boundary)
+    torch::Tensor node_x,   // [N_nodes] float64 — x coordinates (meters)
+    torch::Tensor node_y,   // [N_nodes] float64 — y coordinates
+    torch::Tensor elements, // [N_elt, 3] int64 — 0-based node indices
+    torch::Tensor
+        adjacency, // [N_elt, 3] int64 — neighbor per side (-1 = boundary)
     // Per-node modal data
-    torch::Tensor node_k,       // [N_nodes, M_max] complex128 — wavenumbers
-    torch::Tensor node_phi_s,   // [N_nodes, M_max] complex128 — phi at source depth
-    torch::Tensor node_phi_r,   // [N_nodes, M_max] complex128 — phi at receiver depth
-    torch::Tensor node_M,       // [N_nodes] int64 — mode count per node
+    torch::Tensor node_k, // [N_nodes, M_max] complex128 — wavenumbers
+    torch::Tensor
+        node_phi_s, // [N_nodes, M_max] complex128 — phi at source depth
+    torch::Tensor
+        node_phi_r,       // [N_nodes, M_max] complex128 — phi at receiver depth
+    torch::Tensor node_M, // [N_nodes] int64 — mode count per node
     // Source
     double sx, double sy,
-    int64_t ie_src,             // source element index
+    int64_t ie_src, // source element index
     // Beam params
-    double alpha1_deg, double alpha2_deg, int64_t n_alpha,
-    double step_size, int64_t n_steps, double eps_mult,
+    double alpha1_deg, double alpha2_deg, int64_t n_alpha, double step_size,
+    int64_t n_steps, double eps_mult,
     // Receiver grid
-    torch::Tensor rad_cos,      // [N_theta] float64
-    torch::Tensor rad_sin,      // [N_theta] float64
+    torch::Tensor rad_cos, // [N_theta] float64
+    torch::Tensor rad_sin, // [N_theta] float64
     double r_min, double r_max, int64_t n_r,
     // Limits
     int64_t M_limit,
-    char beam_type              // 'F' or 'M'
+    char beam_type // 'F' or 'M'
 ) {
   using C = c10::complex<double>;
   const double PI = 3.141592653589793;
@@ -2400,34 +2626,46 @@ torch::Tensor field3d_gbt_cpp(
   const double *ny = node_y.data_ptr<double>();
   const int64_t *elt = elements.data_ptr<int64_t>();
   const int64_t *adj = adjacency.data_ptr<int64_t>();
-  const C *nk = reinterpret_cast<const C*>(node_k.data_ptr());
-  const C *nps = reinterpret_cast<const C*>(node_phi_s.data_ptr());
-  const C *npr = reinterpret_cast<const C*>(node_phi_r.data_ptr());
+  const C *nk = reinterpret_cast<const C *>(node_k.data_ptr());
+  const C *nps = reinterpret_cast<const C *>(node_phi_s.data_ptr());
+  const C *npr = reinterpret_cast<const C *>(node_phi_r.data_ptr());
   const int64_t *nM = node_M.data_ptr<int64_t>();
   const double *rc = rad_cos.data_ptr<double>();
   const double *rs = rad_sin.data_ptr<double>();
 
   auto P_t = torch::zeros({n_theta, n_r}, torch::dtype(torch::kComplexDouble));
-  C *P = reinterpret_cast<C*>(P_t.data_ptr());
+  C *P = reinterpret_cast<C *>(P_t.data_ptr());
 
   // Helper: get element info for a mode
-  auto get_elt = [&](int64_t ie, int64_t mode,
-      double &x1, double &y1, double &x2, double &y2, double &x3, double &y3,
-      double &D12, double &D13, double &D23, double &delta,
-      int64_t &s1, int64_t &s2, int64_t &s3, int64_t &Mprop,
-      C &cx_out, C &cy_out) -> bool {
-    s1 = elt[ie*3]; s2 = elt[ie*3+1]; s3 = elt[ie*3+2];
+  auto get_elt = [&](int64_t ie, int64_t mode, double &x1, double &y1,
+                     double &x2, double &y2, double &x3, double &y3,
+                     double &D12, double &D13, double &D23, double &delta,
+                     int64_t &s1, int64_t &s2, int64_t &s3, int64_t &Mprop,
+                     C &cx_out, C &cy_out) -> bool {
+    s1 = elt[ie * 3];
+    s2 = elt[ie * 3 + 1];
+    s3 = elt[ie * 3 + 2];
     Mprop = std::min({nM[s1], nM[s2], nM[s3], M_max});
-    if (mode >= Mprop) return false;
-    x1 = nx[s1]; y1 = ny[s1]; x2 = nx[s2]; y2 = ny[s2]; x3 = nx[s3]; y3 = ny[s3];
-    D12 = x1*y2 - y1*x2; D13 = x1*y3 - y1*x3; D23 = x2*y3 - y2*x3;
+    if (mode >= Mprop)
+      return false;
+    x1 = nx[s1];
+    y1 = ny[s1];
+    x2 = nx[s2];
+    y2 = ny[s2];
+    x3 = nx[s3];
+    y3 = ny[s3];
+    D12 = x1 * y2 - y1 * x2;
+    D13 = x1 * y3 - y1 * x3;
+    D23 = x2 * y3 - y2 * x3;
     delta = D23 - D13 + D12;
-    if (std::abs(delta) < 1e-30) return false;
-    C k1 = nk[s1*M_max+mode], k2 = nk[s2*M_max+mode], k3 = nk[s3*M_max+mode];
-    double A1x=-y3+y2, A2x=y3-y1, A3x=-y2+y1;
-    double A1y=x3-x2, A2y=-x3+x1, A3y=x2-x1;
-    cx_out = (A1x/k1 + A2x/k2 + A3x/k3) / delta;
-    cy_out = (A1y/k1 + A2y/k2 + A3y/k3) / delta;
+    if (std::abs(delta) < 1e-30)
+      return false;
+    C k1 = nk[s1 * M_max + mode], k2 = nk[s2 * M_max + mode],
+      k3 = nk[s3 * M_max + mode];
+    double A1x = -y3 + y2, A2x = y3 - y1, A3x = -y2 + y1;
+    double A1y = x3 - x2, A2y = -x3 + x1, A3y = x2 - x1;
+    cx_out = (A1x / k1 + A2x / k2 + A3x / k3) / delta;
+    cy_out = (A1y / k1 + A2y / k2 + A3y / k3) / delta;
     return true;
   };
 
@@ -2436,42 +2674,51 @@ torch::Tensor field3d_gbt_cpp(
     double tsx = std::cos(alpha), tsy = std::sin(alpha);
 
     for (int64_t mode = 0; mode < M_limit; ++mode) {
-      double x1,y1,x2,y2,x3,y3,D12,D13,D23,delta;
-      int64_t s1,s2,s3,Mprop;
+      double x1, y1, x2, y2, x3, y3, D12, D13, D23, delta;
+      int64_t s1, s2, s3, Mprop;
       C cx, cy;
       int64_t ie = ie_src;
 
-      if (!get_elt(ie, mode, x1,y1,x2,y2,x3,y3,D12,D13,D23,delta,s1,s2,s3,Mprop,cx,cy))
+      if (!get_elt(ie, mode, x1, y1, x2, y2, x3, y3, D12, D13, D23, delta, s1,
+                   s2, s3, Mprop, cx, cy))
         continue;
-      if (mode >= Mprop) continue;
+      if (mode >= Mprop)
+        continue;
 
       // Barycentric at source
-      double DB1=sx*y1-sy*x1, DB2=sx*y2-sy*x2, DB3=sx*y3-sy*x3;
-      double A1=(D23-DB3+DB2)/delta, A2=(DB3-D13-DB1)/delta, A3=(-DB2+DB1+D12)/delta;
+      double DB1 = sx * y1 - sy * x1, DB2 = sx * y2 - sy * x2,
+             DB3 = sx * y3 - sy * x3;
+      double A1 = (D23 - DB3 + DB2) / delta, A2 = (DB3 - D13 - DB1) / delta,
+             A3 = (-DB2 + DB1 + D12) / delta;
 
-      C cA = A1/nk[s1*M_max+mode] + A2/nk[s2*M_max+mode] + A3/nk[s3*M_max+mode];
-      C phi_src = A1*nps[s1*M_max+mode] + A2*nps[s2*M_max+mode] + A3*nps[s3*M_max+mode];
+      C cA = A1 / nk[s1 * M_max + mode] + A2 / nk[s2 * M_max + mode] +
+             A3 / nk[s3 * M_max + mode];
+      C phi_src = A1 * nps[s1 * M_max + mode] + A2 * nps[s2 * M_max + mode] +
+                  A3 * nps[s3 * M_max + mode];
 
       double Hwidth;
-      if (beam_type == 'F') Hwidth = 2.0 / (std::real(C(1.0)/cA) * d_alpha);
-      else Hwidth = std::sqrt(2.0 * std::real(cA) * r_max);
+      if (beam_type == 'F')
+        Hwidth = 2.0 / (std::real(C(1.0) / cA) * d_alpha);
+      else
+        Hwidth = std::sqrt(2.0 * std::real(cA) * r_max);
       double EpsOpt = 0.5 * Hwidth * Hwidth;
       C eps = C(0.0, eps_mult * EpsOpt);
       C cnst = phi_src * std::sqrt(eps / cA) * d_alpha;
 
-      double xA=sx, yA=sy;
-      double xiA=tsx/std::real(cA), etaA=tsy/std::real(cA);
-      C pA(1.0), qA=eps, tauA(0.0);
+      double xA = sx, yA = sy;
+      double xiA = tsx / std::real(cA), etaA = tsy / std::real(cA);
+      C pA(1.0), qA = eps, tauA(0.0);
       int KMAHA = 1;
-      C phiA = A1*npr[s1*M_max+mode] + A2*npr[s2*M_max+mode] + A3*npr[s3*M_max+mode];
+      C phiA = A1 * npr[s1 * M_max + mode] + A2 * npr[s2 * M_max + mode] +
+               A3 * npr[s3 * M_max + mode];
       bool exited = false;
 
       for (int64_t istep = 0; istep < n_steps; ++istep) {
         double cA_r = std::real(cA);
         double xB = xA + step_size * cA_r * xiA;
         double yB = yA + step_size * cA_r * etaA;
-        double xiB = xiA - step_size * std::real(cx / (cA*cA));
-        double etaB = etaA - step_size * std::real(cy / (cA*cA));
+        double xiB = xiA - step_size * std::real(cx / (cA * cA));
+        double etaB = etaA - step_size * std::real(cy / (cA * cA));
         C pB = pA;
         C qB = qA + step_size * cA_r * pA;
         C tauB = tauA + step_size / cA;
@@ -2479,72 +2726,112 @@ torch::Tensor field3d_gbt_cpp(
         int KMAHB = KMAHA;
         if (std::real(qB) < 0.0) {
           if ((std::imag(qA) < 0 && std::imag(qB) >= 0) ||
-              (std::imag(qA) > 0 && std::imag(qB) <= 0)) KMAHB = -KMAHA;
+              (std::imag(qA) > 0 && std::imag(qB) <= 0))
+            KMAHB = -KMAHA;
         }
 
         C cB = cA, phiB = phiA;
         if (!exited) {
-          DB1=xB*y1-yB*x1; DB2=xB*y2-yB*x2; DB3=xB*y3-yB*x3;
-          A1=(D23-DB3+DB2)/delta; A2=(DB3-D13-DB1)/delta; A3=(-DB2+DB1+D12)/delta;
+          DB1 = xB * y1 - yB * x1;
+          DB2 = xB * y2 - yB * x2;
+          DB3 = xB * y3 - yB * x3;
+          A1 = (D23 - DB3 + DB2) / delta;
+          A2 = (DB3 - D13 - DB1) / delta;
+          A3 = (-DB2 + DB1 + D12) / delta;
 
-          for (int cross = 0; cross < 100 && (A1<0||A2<0||A3<0); ++cross) {
-            int side = (A3<0) ? 0 : (A1<0 ? 1 : 2);
-            int64_t next = adj[ie*3+side];
-            if (next < 0) { exited = true; cx=C(0); cy=C(0); break; }
+          for (int cross = 0; cross < 100 && (A1 < 0 || A2 < 0 || A3 < 0);
+               ++cross) {
+            // Porter: A3→side opposite vtx2 (ICORNER[2]), A2→[1], A1→[0]; A3
+            // wins.
+            int side = (A3 < 0) ? 2 : (A2 < 0 ? 1 : 0);
+            int64_t next = adj[ie * 3 + side];
+            if (next < 0) {
+              exited = true;
+              cx = C(0);
+              cy = C(0);
+              break;
+            }
             ie = next;
-            if (!get_elt(ie,mode,x1,y1,x2,y2,x3,y3,D12,D13,D23,delta,s1,s2,s3,Mprop,cx,cy))
-              { exited = true; break; }
-            if (mode >= Mprop) { exited = true; break; }
-            DB1=xB*y1-yB*x1; DB2=xB*y2-yB*x2; DB3=xB*y3-yB*x3;
-            A1=(D23-DB3+DB2)/delta; A2=(DB3-D13-DB1)/delta; A3=(-DB2+DB1+D12)/delta;
+            if (!get_elt(ie, mode, x1, y1, x2, y2, x3, y3, D12, D13, D23, delta,
+                         s1, s2, s3, Mprop, cx, cy)) {
+              exited = true;
+              break;
+            }
+            if (mode >= Mprop) {
+              exited = true;
+              break;
+            }
+            DB1 = xB * y1 - yB * x1;
+            DB2 = xB * y2 - yB * x2;
+            DB3 = xB * y3 - yB * x3;
+            A1 = (D23 - DB3 + DB2) / delta;
+            A2 = (DB3 - D13 - DB1) / delta;
+            A3 = (-DB2 + DB1 + D12) / delta;
           }
           if (!exited) {
-            cB = A1/nk[s1*M_max+mode]+A2/nk[s2*M_max+mode]+A3/nk[s3*M_max+mode];
-            phiB = A1*npr[s1*M_max+mode]+A2*npr[s2*M_max+mode]+A3*npr[s3*M_max+mode];
+            cB = A1 / nk[s1 * M_max + mode] + A2 / nk[s2 * M_max + mode] +
+                 A3 / nk[s3 * M_max + mode];
+            phiB = A1 * npr[s1 * M_max + mode] + A2 * npr[s2 * M_max + mode] +
+                   A3 * npr[s3 * M_max + mode];
           }
         }
 
         // Influence on receivers
-        double _xA=xA-sx, _yA=yA-sy, _xB=xB-sx, _yB=yB-sy;
+        double _xA = xA - sx, _yA = yA - sy, _xB = xB - sx, _yB = yB - sy;
         for (int64_t it = 0; it < n_theta; ++it) {
-          double rv1=rc[it], rv2=rs[it];
-          double dA = rv1*xiA + rv2*etaA;
-          double dB = rv1*xiB + rv2*etaB;
-          if (std::abs(dA)<1e-30 || std::abs(dB)<1e-30 || dA*dB<=0) continue;
-          double rA = (_yA*etaA+_xA*xiA)/dA;
-          double rB = (_yB*etaB+_xB*xiB)/dB;
-          int64_t ir1 = std::max(std::min((int64_t)((rA-r_min)/delta_r)+1, n_r), (int64_t)0);
-          int64_t ir2 = std::max(std::min((int64_t)((rB-r_min)/delta_r)+1, n_r), (int64_t)1);
-          if (ir2 <= ir1) continue;
-          double nA_v = (_xA*rv2-_yA*rv1)/(cA_r*dA);
-          double nB_v = (_xB*rv2-_yB*rv1)/(std::real(cB)*dB);
+          double rv1 = rc[it], rv2 = rs[it];
+          double dA = rv1 * xiA + rv2 * etaA;
+          double dB = rv1 * xiB + rv2 * etaB;
+          if (std::abs(dA) < 1e-30 || std::abs(dB) < 1e-30 || dA * dB <= 0)
+            continue;
+          double rA = (_yA * etaA + _xA * xiA) / dA;
+          double rB = (_yB * etaB + _xB * xiB) / dB;
+          int64_t ir1 = std::max(
+              std::min((int64_t)((rA - r_min) / delta_r) + 1, n_r), (int64_t)0);
+          int64_t ir2 = std::max(
+              std::min((int64_t)((rB - r_min) / delta_r) + 1, n_r), (int64_t)1);
+          if (ir2 <= ir1)
+            continue;
+          double nA_v = (_xA * rv2 - _yA * rv1) / (cA_r * dA);
+          double nB_v = (_xB * rv2 - _yB * rv1) / (std::real(cB) * dB);
           double rBA = rB - rA;
-          if (std::abs(rBA) < 1e-30) continue;
-          for (int64_t ir = ir1+1; ir <= std::min(ir2, n_r); ++ir) {
-            double W = (r_min + (ir-1)*delta_r - rA) / rBA;
-            C pM = pA + W*(pB-pA);
-            C qM = qA + W*(qB-qA);
-            double n2 = (nA_v + W*(nB_v-nA_v));
-            n2 = n2*n2;
-            if (qM != C(0) && -0.5*std::imag(pM/qM)*n2 < BEAM_WINDOW) {
-              C cM = cA + W*(cB-cA);
-              C tM = tauA + W*(tauB-tauA);
-              C phM = phiA + W*(phiB-phiA);
+          if (std::abs(rBA) < 1e-30)
+            continue;
+          for (int64_t ir = ir1 + 1; ir <= std::min(ir2, n_r); ++ir) {
+            double W = (r_min + (ir - 1) * delta_r - rA) / rBA;
+            C pM = pA + W * (pB - pA);
+            C qM = qA + W * (qB - qA);
+            double n2 = (nA_v + W * (nB_v - nA_v));
+            n2 = n2 * n2;
+            if (qM != C(0) && -0.5 * std::imag(pM / qM) * n2 < BEAM_WINDOW) {
+              C cM = cA + W * (cB - cA);
+              C tM = tauA + W * (tauB - tauA);
+              C phM = phiA + W * (phiB - phiA);
               int km = KMAHA;
-              if (std::real(qM)<0) {
-                if ((std::imag(qA)<0 && std::imag(qM)>=0)||(std::imag(qA)>0 && std::imag(qM)<=0))
+              if (std::real(qM) < 0) {
+                if ((std::imag(qA) < 0 && std::imag(qM) >= 0) ||
+                    (std::imag(qA) > 0 && std::imag(qM) <= 0))
                   km = -km;
               }
-              C contrib = cnst * phM * std::sqrt(cM/qM) * std::exp(C(0,-1)*(tM + C(0.5)*pM/qM*n2));
-              if (km < 0) contrib = -contrib;
-              P[it*n_r + ir-1] += contrib;
+              C contrib = cnst * phM * std::sqrt(cM / qM) *
+                          std::exp(C(0, -1) * (tM + C(0.5) * pM / qM * n2));
+              if (km < 0)
+                contrib = -contrib;
+              P[it * n_r + ir - 1] += contrib;
             }
           }
         }
 
-        xA=xB; yA=yB; xiA=xiB; etaA=etaB;
-        pA=pB; qA=qB; tauA=tauB; cA=cB;
-        KMAHA=KMAHB; phiA=phiB;
+        xA = xB;
+        yA = yB;
+        xiA = xiB;
+        etaA = etaB;
+        pA = pB;
+        qA = qB;
+        tauA = tauB;
+        cA = cB;
+        KMAHA = KMAHB;
+        phiA = phiB;
       }
     }
   }
@@ -2552,25 +2839,25 @@ torch::Tensor field3d_gbt_cpp(
 }
 
 // ---------------------------------------------------------------------------
-// FIELD3D GBT backward: re-execute forward, accumulate dP/d(node_k) and dP/d(node_phi).
-// Uses the same beam tracing as forward but instead of accumulating P,
-// propagates grad_P back to node_k and node_phi_r via the contribution formula.
+// FIELD3D GBT backward: re-execute forward, accumulate dP/d(node_k) and
+// dP/d(node_phi). Uses the same beam tracing as forward but instead of
+// accumulating P, propagates grad_P back to node_k and node_phi_r via the
+// contribution formula.
 // ---------------------------------------------------------------------------
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp(
-    torch::Tensor grad_P,       // [N_theta, N_r] complex128
-    // Same inputs as forward:
-    torch::Tensor node_x, torch::Tensor node_y,
-    torch::Tensor elements, torch::Tensor adjacency,
-    torch::Tensor node_k, torch::Tensor node_phi_s, torch::Tensor node_phi_r,
-    torch::Tensor node_M_t,
-    double sx, double sy, int64_t ie_src,
-    double alpha1_deg, double alpha2_deg, int64_t n_alpha,
-    double step_size, int64_t n_steps, double eps_mult,
-    torch::Tensor rad_cos, torch::Tensor rad_sin,
-    double r_min, double r_max, int64_t n_r,
-    int64_t M_limit, char beam_type
-) {
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+field3d_gbt_backward_cpp(torch::Tensor grad_P, // [N_theta, N_r] complex128
+                         // Same inputs as forward:
+                         torch::Tensor node_x, torch::Tensor node_y,
+                         torch::Tensor elements, torch::Tensor adjacency,
+                         torch::Tensor node_k, torch::Tensor node_phi_s,
+                         torch::Tensor node_phi_r, torch::Tensor node_M_t,
+                         double sx, double sy, int64_t ie_src,
+                         double alpha1_deg, double alpha2_deg, int64_t n_alpha,
+                         double step_size, int64_t n_steps, double eps_mult,
+                         torch::Tensor rad_cos, torch::Tensor rad_sin,
+                         double r_min, double r_max, int64_t n_r,
+                         int64_t M_limit, char beam_type) {
   using C = c10::complex<double>;
   const double PI = 3.141592653589793;
   const double BEAM_WINDOW = 5.0;
@@ -2587,40 +2874,52 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp
   const double *ny_p = node_y.data_ptr<double>();
   const int64_t *elt = elements.data_ptr<int64_t>();
   const int64_t *adj_p = adjacency.data_ptr<int64_t>();
-  const C *nk = reinterpret_cast<const C*>(node_k.data_ptr());
-  const C *nps = reinterpret_cast<const C*>(node_phi_s.data_ptr());
-  const C *npr = reinterpret_cast<const C*>(node_phi_r.data_ptr());
+  const C *nk = reinterpret_cast<const C *>(node_k.data_ptr());
+  const C *nps = reinterpret_cast<const C *>(node_phi_s.data_ptr());
+  const C *npr = reinterpret_cast<const C *>(node_phi_r.data_ptr());
   const int64_t *nM = node_M_t.data_ptr<int64_t>();
   const double *rc = rad_cos.data_ptr<double>();
   const double *rs = rad_sin.data_ptr<double>();
-  const C *gP = reinterpret_cast<const C*>(grad_P.data_ptr());
+  const C *gP = reinterpret_cast<const C *>(grad_P.data_ptr());
 
   // Output gradients
   auto grad_k = torch::zeros_like(node_k);
   auto grad_phi_s = torch::zeros_like(node_phi_s);
   auto grad_phi_r = torch::zeros_like(node_phi_r);
-  C *gk = reinterpret_cast<C*>(grad_k.data_ptr());
-  C *gps = reinterpret_cast<C*>(grad_phi_s.data_ptr());
-  C *gpr = reinterpret_cast<C*>(grad_phi_r.data_ptr());
+  C *gk = reinterpret_cast<C *>(grad_k.data_ptr());
+  C *gps = reinterpret_cast<C *>(grad_phi_s.data_ptr());
+  C *gpr = reinterpret_cast<C *>(grad_phi_r.data_ptr());
 
   // Re-use get_elt from forward (same lambda)
-  auto get_elt = [&](int64_t ie, int64_t mode,
-      double &x1, double &y1, double &x2, double &y2, double &x3, double &y3,
-      double &D12, double &D13, double &D23, double &delta,
-      int64_t &s1, int64_t &s2, int64_t &s3, int64_t &Mprop,
-      C &cx_out, C &cy_out) -> bool {
-    s1 = elt[ie*3]; s2 = elt[ie*3+1]; s3 = elt[ie*3+2];
+  auto get_elt = [&](int64_t ie, int64_t mode, double &x1, double &y1,
+                     double &x2, double &y2, double &x3, double &y3,
+                     double &D12, double &D13, double &D23, double &delta,
+                     int64_t &s1, int64_t &s2, int64_t &s3, int64_t &Mprop,
+                     C &cx_out, C &cy_out) -> bool {
+    s1 = elt[ie * 3];
+    s2 = elt[ie * 3 + 1];
+    s3 = elt[ie * 3 + 2];
     Mprop = std::min({nM[s1], nM[s2], nM[s3], M_max});
-    if (mode >= Mprop) return false;
-    x1 = nx_p[s1]; y1 = ny_p[s1]; x2 = nx_p[s2]; y2 = ny_p[s2]; x3 = nx_p[s3]; y3 = ny_p[s3];
-    D12 = x1*y2 - y1*x2; D13 = x1*y3 - y1*x3; D23 = x2*y3 - y2*x3;
+    if (mode >= Mprop)
+      return false;
+    x1 = nx_p[s1];
+    y1 = ny_p[s1];
+    x2 = nx_p[s2];
+    y2 = ny_p[s2];
+    x3 = nx_p[s3];
+    y3 = ny_p[s3];
+    D12 = x1 * y2 - y1 * x2;
+    D13 = x1 * y3 - y1 * x3;
+    D23 = x2 * y3 - y2 * x3;
     delta = D23 - D13 + D12;
-    if (std::abs(delta) < 1e-30) return false;
-    C k1 = nk[s1*M_max+mode], k2 = nk[s2*M_max+mode], k3 = nk[s3*M_max+mode];
-    double A1x=-y3+y2, A2x=y3-y1, A3x=-y2+y1;
-    double A1y=x3-x2, A2y=-x3+x1, A3y=x2-x1;
-    cx_out = (A1x/k1 + A2x/k2 + A3x/k3) / delta;
-    cy_out = (A1y/k1 + A2y/k2 + A3y/k3) / delta;
+    if (std::abs(delta) < 1e-30)
+      return false;
+    C k1 = nk[s1 * M_max + mode], k2 = nk[s2 * M_max + mode],
+      k3 = nk[s3 * M_max + mode];
+    double A1x = -y3 + y2, A2x = y3 - y1, A3x = -y2 + y1;
+    double A1y = x3 - x2, A2y = -x3 + x1, A3y = x2 - x1;
+    cx_out = (A1x / k1 + A2x / k2 + A3x / k3) / delta;
+    cy_out = (A1y / k1 + A2y / k2 + A3y / k3) / delta;
     return true;
   };
 
@@ -2630,41 +2929,49 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp
     double tsx = std::cos(alpha), tsy = std::sin(alpha);
 
     for (int64_t mode = 0; mode < M_limit; ++mode) {
-      double x1,y1,x2,y2,x3,y3,D12,D13,D23,delta;
-      int64_t s1,s2,s3,Mprop;
+      double x1, y1, x2, y2, x3, y3, D12, D13, D23, delta;
+      int64_t s1, s2, s3, Mprop;
       C cx, cy;
       int64_t ie = ie_src;
 
-      if (!get_elt(ie, mode, x1,y1,x2,y2,x3,y3,D12,D13,D23,delta,s1,s2,s3,Mprop,cx,cy))
+      if (!get_elt(ie, mode, x1, y1, x2, y2, x3, y3, D12, D13, D23, delta, s1,
+                   s2, s3, Mprop, cx, cy))
         continue;
 
-      double DB1=sx*y1-sy*x1, DB2=sx*y2-sy*x2, DB3=sx*y3-sy*x3;
-      double A1=(D23-DB3+DB2)/delta, A2=(DB3-D13-DB1)/delta, A3=(-DB2+DB1+D12)/delta;
+      double DB1 = sx * y1 - sy * x1, DB2 = sx * y2 - sy * x2,
+             DB3 = sx * y3 - sy * x3;
+      double A1 = (D23 - DB3 + DB2) / delta, A2 = (DB3 - D13 - DB1) / delta,
+             A3 = (-DB2 + DB1 + D12) / delta;
 
-      C cA = A1/nk[s1*M_max+mode] + A2/nk[s2*M_max+mode] + A3/nk[s3*M_max+mode];
-      C phi_src = A1*nps[s1*M_max+mode] + A2*nps[s2*M_max+mode] + A3*nps[s3*M_max+mode];
+      C cA = A1 / nk[s1 * M_max + mode] + A2 / nk[s2 * M_max + mode] +
+             A3 / nk[s3 * M_max + mode];
+      C phi_src = A1 * nps[s1 * M_max + mode] + A2 * nps[s2 * M_max + mode] +
+                  A3 * nps[s3 * M_max + mode];
 
       double Hwidth;
-      if (beam_type == 'F') Hwidth = 2.0 / (std::real(C(1.0)/cA) * d_alpha);
-      else Hwidth = std::sqrt(2.0 * std::real(cA) * r_max);
+      if (beam_type == 'F')
+        Hwidth = 2.0 / (std::real(C(1.0) / cA) * d_alpha);
+      else
+        Hwidth = std::sqrt(2.0 * std::real(cA) * r_max);
       double EpsOpt = 0.5 * Hwidth * Hwidth;
       C eps = C(0.0, eps_mult * EpsOpt);
       C cnst = phi_src * std::sqrt(eps / cA) * d_alpha;
 
-      double xA=sx, yA=sy;
-      double xiA=tsx/std::real(cA), etaA=tsy/std::real(cA);
-      C pA(1.0), qA=eps, tauA(0.0);
+      double xA = sx, yA = sy;
+      double xiA = tsx / std::real(cA), etaA = tsy / std::real(cA);
+      C pA(1.0), qA = eps, tauA(0.0);
       int KMAHA = 1;
-      C phiA = A1*npr[s1*M_max+mode] + A2*npr[s2*M_max+mode] + A3*npr[s3*M_max+mode];
+      C phiA = A1 * npr[s1 * M_max + mode] + A2 * npr[s2 * M_max + mode] +
+               A3 * npr[s3 * M_max + mode];
 
       // Source element info for phi_src gradient
-      int64_t src_s1=s1, src_s2=s2, src_s3=s3;
-      double src_A1=A1, src_A2=A2, src_A3=A3;
-      C grad_phi_src_acc(0);  // accumulate contrib/phi_src over all hits
+      int64_t src_s1 = s1, src_s2 = s2, src_s3 = s3;
+      double src_A1 = A1, src_A2 = A2, src_A3 = A3;
+      C grad_phi_src_acc(0); // accumulate contrib/phi_src over all hits
 
       // Track current element's node indices for gradient accumulation
-      int64_t cur_s1=s1, cur_s2=s2, cur_s3=s3;
-      double cur_A1=A1, cur_A2=A2, cur_A3=A3;
+      int64_t cur_s1 = s1, cur_s2 = s2, cur_s3 = s3;
+      double cur_A1 = A1, cur_A2 = A2, cur_A3 = A3;
       bool exited = false;
       int64_t n_actual_steps = 0;
 
@@ -2686,8 +2993,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp
         double cA_r = std::real(cA);
         double xB = xA + step_size * cA_r * xiA;
         double yB = yA + step_size * cA_r * etaA;
-        double xiB = xiA - step_size * std::real(cx / (cA*cA));
-        double etaB = etaA - step_size * std::real(cy / (cA*cA));
+        double xiB = xiA - step_size * std::real(cx / (cA * cA));
+        double etaB = etaA - step_size * std::real(cy / (cA * cA));
         C pB = pA;
         C qB = qA + step_size * cA_r * pA;
         C tauB = tauA + step_size / cA;
@@ -2695,97 +3002,140 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp
         int KMAHB = KMAHA;
         if (std::real(qB) < 0.0) {
           if ((std::imag(qA) < 0 && std::imag(qB) >= 0) ||
-              (std::imag(qA) > 0 && std::imag(qB) <= 0)) KMAHB = -KMAHA;
+              (std::imag(qA) > 0 && std::imag(qB) <= 0))
+            KMAHB = -KMAHA;
         }
 
         C cB = cA, phiB = phiA;
-        int64_t B_s1=cur_s1, B_s2=cur_s2, B_s3=cur_s3;
-        double B_A1=cur_A1, B_A2=cur_A2, B_A3=cur_A3;
+        int64_t B_s1 = cur_s1, B_s2 = cur_s2, B_s3 = cur_s3;
+        double B_A1 = cur_A1, B_A2 = cur_A2, B_A3 = cur_A3;
 
         if (!exited) {
-          DB1=xB*y1-yB*x1; DB2=xB*y2-yB*x2; DB3=xB*y3-yB*x3;
-          A1=(D23-DB3+DB2)/delta; A2=(DB3-D13-DB1)/delta; A3=(-DB2+DB1+D12)/delta;
+          DB1 = xB * y1 - yB * x1;
+          DB2 = xB * y2 - yB * x2;
+          DB3 = xB * y3 - yB * x3;
+          A1 = (D23 - DB3 + DB2) / delta;
+          A2 = (DB3 - D13 - DB1) / delta;
+          A3 = (-DB2 + DB1 + D12) / delta;
 
-          for (int cross = 0; cross < 100 && (A1<0||A2<0||A3<0); ++cross) {
-            int side = (A3<0) ? 0 : (A1<0 ? 1 : 2);
-            int64_t next = adj_p[ie*3+side];
-            if (next < 0) { exited = true; cx=C(0); cy=C(0); break; }
+          for (int cross = 0; cross < 100 && (A1 < 0 || A2 < 0 || A3 < 0);
+               ++cross) {
+            // Porter: A3→side opposite vtx2 (ICORNER[2]), A2→[1], A1→[0]; A3
+            // wins.
+            int side = (A3 < 0) ? 2 : (A2 < 0 ? 1 : 0);
+            int64_t next = adj_p[ie * 3 + side];
+            if (next < 0) {
+              exited = true;
+              cx = C(0);
+              cy = C(0);
+              break;
+            }
             ie = next;
-            if (!get_elt(ie,mode,x1,y1,x2,y2,x3,y3,D12,D13,D23,delta,s1,s2,s3,Mprop,cx,cy))
-              { exited = true; break; }
-            if (mode >= Mprop) { exited = true; break; }
-            DB1=xB*y1-yB*x1; DB2=xB*y2-yB*x2; DB3=xB*y3-yB*x3;
-            A1=(D23-DB3+DB2)/delta; A2=(DB3-D13-DB1)/delta; A3=(-DB2+DB1+D12)/delta;
+            if (!get_elt(ie, mode, x1, y1, x2, y2, x3, y3, D12, D13, D23, delta,
+                         s1, s2, s3, Mprop, cx, cy)) {
+              exited = true;
+              break;
+            }
+            if (mode >= Mprop) {
+              exited = true;
+              break;
+            }
+            DB1 = xB * y1 - yB * x1;
+            DB2 = xB * y2 - yB * x2;
+            DB3 = xB * y3 - yB * x3;
+            A1 = (D23 - DB3 + DB2) / delta;
+            A2 = (DB3 - D13 - DB1) / delta;
+            A3 = (-DB2 + DB1 + D12) / delta;
           }
           if (!exited) {
-            cB = A1/nk[s1*M_max+mode]+A2/nk[s2*M_max+mode]+A3/nk[s3*M_max+mode];
-            phiB = A1*npr[s1*M_max+mode]+A2*npr[s2*M_max+mode]+A3*npr[s3*M_max+mode];
-            B_s1=s1; B_s2=s2; B_s3=s3;
-            B_A1=A1; B_A2=A2; B_A3=A3;
+            cB = A1 / nk[s1 * M_max + mode] + A2 / nk[s2 * M_max + mode] +
+                 A3 / nk[s3 * M_max + mode];
+            phiB = A1 * npr[s1 * M_max + mode] + A2 * npr[s2 * M_max + mode] +
+                   A3 * npr[s3 * M_max + mode];
+            B_s1 = s1;
+            B_s2 = s2;
+            B_s3 = s3;
+            B_A1 = A1;
+            B_A2 = A2;
+            B_A3 = A3;
           }
         }
 
         // Save full beam state at step A for ODE adjoint reverse sweep
-        step_states[istep] = {cA, phiA, pA, qA, tauA, cx, cy,
-                              xA, yA, xiA, etaA, cA_r,
+        step_states[istep] = {cA,     phiA,   pA,     qA,     tauA,   cx,
+                              cy,     xA,     yA,     xiA,    etaA,   cA_r,
                               cur_s1, cur_s2, cur_s3, cur_A1, cur_A2, cur_A3};
 
         // Compute per-hit gradients for phi (direct) and tau (for ODE adjoint)
-        double _xA=xA-sx, _yA=yA-sy, _xB=xB-sx, _yB=yB-sy;
+        double _xA = xA - sx, _yA = yA - sy, _xB = xB - sx, _yB = yB - sy;
         for (int64_t it = 0; it < n_theta; ++it) {
-          double rv1=rc[it], rv2=rs[it];
-          double dA = rv1*xiA + rv2*etaA;
-          double dB = rv1*xiB + rv2*etaB;
-          if (std::abs(dA)<1e-30 || std::abs(dB)<1e-30 || dA*dB<=0) continue;
-          double rA_v = (_yA*etaA+_xA*xiA)/dA;
-          double rB_v = (_yB*etaB+_xB*xiB)/dB;
-          int64_t ir1 = std::max(std::min((int64_t)((rA_v-r_min)/delta_r)+1, n_r), (int64_t)0);
-          int64_t ir2 = std::max(std::min((int64_t)((rB_v-r_min)/delta_r)+1, n_r), (int64_t)1);
-          if (ir2 <= ir1) continue;
-          double nA_v = (_xA*rv2-_yA*rv1)/(cA_r*dA);
-          double nB_v = (_xB*rv2-_yB*rv1)/(std::real(cB)*dB);
+          double rv1 = rc[it], rv2 = rs[it];
+          double dA = rv1 * xiA + rv2 * etaA;
+          double dB = rv1 * xiB + rv2 * etaB;
+          if (std::abs(dA) < 1e-30 || std::abs(dB) < 1e-30 || dA * dB <= 0)
+            continue;
+          double rA_v = (_yA * etaA + _xA * xiA) / dA;
+          double rB_v = (_yB * etaB + _xB * xiB) / dB;
+          int64_t ir1 =
+              std::max(std::min((int64_t)((rA_v - r_min) / delta_r) + 1, n_r),
+                       (int64_t)0);
+          int64_t ir2 =
+              std::max(std::min((int64_t)((rB_v - r_min) / delta_r) + 1, n_r),
+                       (int64_t)1);
+          if (ir2 <= ir1)
+            continue;
+          double nA_v = (_xA * rv2 - _yA * rv1) / (cA_r * dA);
+          double nB_v = (_xB * rv2 - _yB * rv1) / (std::real(cB) * dB);
           double rBA = rB_v - rA_v;
-          if (std::abs(rBA) < 1e-30) continue;
-          for (int64_t ir = ir1+1; ir <= std::min(ir2, n_r); ++ir) {
-            double W = (r_min + (ir-1)*delta_r - rA_v) / rBA;
-            C pM = pA + W*(pB-pA);
-            C qM = qA + W*(qB-qA);
-            double n2 = (nA_v + W*(nB_v-nA_v)); n2 = n2*n2;
-            if (qM != C(0) && -0.5*std::imag(pM/qM)*n2 < BEAM_WINDOW) {
-              C cM = cA + W*(cB-cA);
-              C tM = tauA + W*(tauB-tauA);
-              C phM = phiA + W*(phiB-phiA);
+          if (std::abs(rBA) < 1e-30)
+            continue;
+          for (int64_t ir = ir1 + 1; ir <= std::min(ir2, n_r); ++ir) {
+            double W = (r_min + (ir - 1) * delta_r - rA_v) / rBA;
+            C pM = pA + W * (pB - pA);
+            C qM = qA + W * (qB - qA);
+            double n2 = (nA_v + W * (nB_v - nA_v));
+            n2 = n2 * n2;
+            if (qM != C(0) && -0.5 * std::imag(pM / qM) * n2 < BEAM_WINDOW) {
+              C cM = cA + W * (cB - cA);
+              C tM = tauA + W * (tauB - tauA);
+              C phM = phiA + W * (phiB - phiA);
               int km = KMAHA;
-              if (std::real(qM)<0) {
-                if ((std::imag(qA)<0 && std::imag(qM)>=0)||(std::imag(qA)>0 && std::imag(qM)<=0))
+              if (std::real(qM) < 0) {
+                if ((std::imag(qA) < 0 && std::imag(qM) >= 0) ||
+                    (std::imag(qA) > 0 && std::imag(qM) <= 0))
                   km = -km;
               }
-              C contrib = cnst * phM * std::sqrt(cM/qM) * std::exp(C(0,-1)*(tM + C(0.5)*pM/qM*n2));
-              if (km < 0) contrib = -contrib;
+              C contrib = cnst * phM * std::sqrt(cM / qM) *
+                          std::exp(C(0, -1) * (tM + C(0.5) * pM / qM * n2));
+              if (km < 0)
+                contrib = -contrib;
 
-              C gp = gP[it*n_r + ir-1];
-              if (std::abs(gp) < 1e-30) continue;
+              C gp = gP[it * n_r + ir - 1];
+              if (std::abs(gp) < 1e-30)
+                continue;
 
               // Wirtinger chain rule for real loss L through complex P:
               //   ∂L/∂conj(z) = conj(∂P/∂z) * ∂L/∂conj(P)
-              // where gp = ∂L/∂conj(P). So all ∂contrib/∂var must be conjugated.
+              // where gp = ∂L/∂conj(P). So all ∂contrib/∂var must be
+              // conjugated.
               C contrib_conj = std::conj(contrib);
 
-              // phi_r gradient: ∂contrib/∂phiM = contrib/phiM (holomorphic, linear)
-              // phiM = (1-W)*phiA + W*phiB
+              // phi_r gradient: ∂contrib/∂phiM = contrib/phiM (holomorphic,
+              // linear) phiM = (1-W)*phiA + W*phiB
               if (std::abs(phM) > 1e-30) {
-                C dphi_conj = contrib_conj / std::conj(phM);  // conj(contrib/phM)
+                C dphi_conj =
+                    contrib_conj / std::conj(phM); // conj(contrib/phM)
                 // B-side (weight W)
                 C g_phiB = gp * C(W) * dphi_conj;
-                gpr[B_s1*M_max+mode] += g_phiB * C(B_A1);
-                gpr[B_s2*M_max+mode] += g_phiB * C(B_A2);
-                gpr[B_s3*M_max+mode] += g_phiB * C(B_A3);
+                gpr[B_s1 * M_max + mode] += g_phiB * C(B_A1);
+                gpr[B_s2 * M_max + mode] += g_phiB * C(B_A2);
+                gpr[B_s3 * M_max + mode] += g_phiB * C(B_A3);
                 // A-side (weight 1-W)
                 C g_phiA = gp * C(1.0 - W) * dphi_conj;
                 auto &stA = step_states[istep];
-                gpr[stA.s1*M_max+mode] += g_phiA * C(stA.A1);
-                gpr[stA.s2*M_max+mode] += g_phiA * C(stA.A2);
-                gpr[stA.s3*M_max+mode] += g_phiA * C(stA.A3);
+                gpr[stA.s1 * M_max + mode] += g_phiA * C(stA.A1);
+                gpr[stA.s2 * M_max + mode] += g_phiA * C(stA.A2);
+                gpr[stA.s3 * M_max + mode] += g_phiA * C(stA.A3);
               }
 
               // phi_src gradient: cnst = phi_src * sqrt(eps/cA) * d_alpha
@@ -2796,12 +3146,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp
 
               // ODE adjoint seeds: conj(∂contrib/∂var) * gp
               // d(contrib)/d(tauM) = -i * contrib → conj = i * conj(contrib)
-              C grad_tau_hit = gp * C(0,1) * contrib_conj;
+              C grad_tau_hit = gp * C(0, 1) * contrib_conj;
               adj_tau[istep] += (1.0 - W) * grad_tau_hit;
               if (istep + 1 < n_steps)
                 adj_tau[istep + 1] += W * grad_tau_hit;
 
-              // d(contrib)/d(cM) = 0.5/cM * contrib → conj = 0.5*conj(contrib)/conj(cM)
+              // d(contrib)/d(cM) = 0.5/cM * contrib → conj =
+              // 0.5*conj(contrib)/conj(cM)
               if (std::abs(cM) > 1e-30) {
                 C grad_c_hit = gp * C(0.5) * contrib_conj / std::conj(cM);
                 adj_c_local[istep] += (1.0 - W) * grad_c_hit;
@@ -2812,7 +3163,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp
               // d(contrib)/d(qM) = contrib*(-0.5/qM + i*0.5*pM/qM²*n²)
               if (std::abs(qM) > 1e-30) {
                 C pq = pM / qM;
-                C dq = -C(0.5)/qM + C(0,0.5)*pq/qM*n2;
+                C dq = -C(0.5) / qM + C(0, 0.5) * pq / qM * n2;
                 C grad_q_hit = gp * std::conj(contrib * dq);
                 adj_q_local[istep] += (1.0 - W) * grad_q_hit;
                 if (istep + 1 < n_steps)
@@ -2822,18 +3173,30 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp
           }
         }
 
-        xA=xB; yA=yB; xiA=xiB; etaA=etaB;
-        pA=pB; qA=qB; tauA=tauB; cA=cB;
-        KMAHA=KMAHB; phiA=phiB;
-        cur_s1=B_s1; cur_s2=B_s2; cur_s3=B_s3;
-        cur_A1=B_A1; cur_A2=B_A2; cur_A3=B_A3;
+        xA = xB;
+        yA = yB;
+        xiA = xiB;
+        etaA = etaB;
+        pA = pB;
+        qA = qB;
+        tauA = tauB;
+        cA = cB;
+        KMAHA = KMAHB;
+        phiA = phiB;
+        cur_s1 = B_s1;
+        cur_s2 = B_s2;
+        cur_s3 = B_s3;
+        cur_A1 = B_A1;
+        cur_A2 = B_A2;
+        cur_A3 = B_A3;
         n_actual_steps = istep + 1;
       }
 
-      // Full ODE adjoint (Wirtinger): sweep backward, accumulate adjoint variables.
-      // All adjoints are Wirtinger conjugate derivatives: adj_z = ∂L/∂conj(z).
-      // For holomorphic f(z): ∂L/∂conj(z) = conj(∂f/∂z) * ∂L/∂conj(f)
-      // For non-holomorphic Re(z): special treatment (see q channel).
+      // Full ODE adjoint (Wirtinger): sweep backward, accumulate adjoint
+      // variables. All adjoints are Wirtinger conjugate derivatives: adj_z =
+      // ∂L/∂conj(z). For holomorphic f(z): ∂L/∂conj(z) = conj(∂f/∂z) *
+      // ∂L/∂conj(f) For non-holomorphic Re(z): special treatment (see q
+      // channel).
       //
       // Forward ODE per step:
       //   tauB = tauA + step/cA  (holomorphic in cA)
@@ -2843,9 +3206,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp
       //
       // adj_tauA += adj_tauB  (additive, ∂tauB/∂tauA = 1)
       // adj_qA += adj_qB      (additive, ∂qB/∂qA = 1)
-      // NOTE: xi/eta adjoint omitted. These affect the beam-receiver hit geometry
-      // (interpolation weight W, normal distance n) but their contribution to
-      // dL/d(node_k) is O(step² * dcx/dk) ≈ 3% for typical step sizes.
+      // NOTE: xi/eta adjoint omitted. These affect the beam-receiver hit
+      // geometry (interpolation weight W, normal distance n) but their
+      // contribution to dL/d(node_k) is O(step² * dcx/dk) ≈ 3% for typical step
+      // sizes.
       C a_tau_acc(0), a_q_acc(0);
       for (int64_t istep = n_actual_steps - 1; istep >= 0; --istep) {
         a_tau_acc += adj_tau[istep];
@@ -2853,7 +3217,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp
         C a_c_step = adj_c_local[istep];
 
         auto &st = step_states[istep];
-        if (std::abs(st.cA) < 1e-30) continue;
+        if (std::abs(st.cA) < 1e-30)
+          continue;
 
         // Phase channel (holomorphic): tauB = tauA + step/cA
         //   ∂tauB/∂cA = -step/cA²  →  conj(∂tauB/∂cA) = -step/conj(cA²)
@@ -2870,20 +3235,848 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> field3d_gbt_backward_cpp
 
         // Distribute adj_c to node k (holomorphic): cA = A1/k1 + A2/k2 + A3/k3
         //   ∂cA/∂ki = -Ai/ki²  →  conj(...) = -Ai/conj(ki²)
-        C k1 = nk[st.s1*M_max+mode], k2 = nk[st.s2*M_max+mode], k3 = nk[st.s3*M_max+mode];
-        gk[st.s1*M_max+mode] += a_c_step * C(-st.A1) / std::conj(k1*k1);
-        gk[st.s2*M_max+mode] += a_c_step * C(-st.A2) / std::conj(k2*k2);
-        gk[st.s3*M_max+mode] += a_c_step * C(-st.A3) / std::conj(k3*k3);
+        C k1 = nk[st.s1 * M_max + mode], k2 = nk[st.s2 * M_max + mode],
+          k3 = nk[st.s3 * M_max + mode];
+        gk[st.s1 * M_max + mode] += a_c_step * C(-st.A1) / std::conj(k1 * k1);
+        gk[st.s2 * M_max + mode] += a_c_step * C(-st.A2) / std::conj(k2 * k2);
+        gk[st.s3 * M_max + mode] += a_c_step * C(-st.A3) / std::conj(k3 * k3);
       }
 
       // Distribute accumulated phi_src gradient to source element nodes
       if (std::abs(grad_phi_src_acc) > 1e-30) {
-        gps[src_s1*M_max+mode] += grad_phi_src_acc * C(src_A1);
-        gps[src_s2*M_max+mode] += grad_phi_src_acc * C(src_A2);
-        gps[src_s3*M_max+mode] += grad_phi_src_acc * C(src_A3);
+        gps[src_s1 * M_max + mode] += grad_phi_src_acc * C(src_A1);
+        gps[src_s2 * M_max + mode] += grad_phi_src_acc * C(src_A2);
+        gps[src_s3 * M_max + mode] += grad_phi_src_acc * C(src_A3);
       }
     }
   }
+  return std::make_tuple(grad_k, grad_phi_s, grad_phi_r);
+}
+
+// ---------------------------------------------------------------------------
+// FIELD3D STD (Nx2D adiabatic) forward kernel.
+// For each theta direction: trace a ray through the triangulation, accumulate
+// phase along it, and sum modal contributions at each receiver range.
+// Pre-conditions (same as GBT): node_k, node_phi_s, node_phi_r are
+// [N_nodes, M_max] complex128, already mode-aligned to node 0's ordering.
+// ---------------------------------------------------------------------------
+
+torch::Tensor
+field3d_std_cpp(torch::Tensor node_x,     // [N_nodes] float64
+                torch::Tensor node_y,     // [N_nodes] float64
+                torch::Tensor elements,   // [N_elt, 3] int64
+                torch::Tensor adjacency,  // [N_elt, 3] int64
+                torch::Tensor node_k,     // [N_nodes, M_max] complex128
+                torch::Tensor node_phi_s, // [N_nodes, M_max] complex128
+                torch::Tensor node_phi_r, // [N_nodes, M_max] complex128
+                torch::Tensor node_M_t,   // [N_nodes] int64
+                double sx, double sy, int64_t ie_src,
+                torch::Tensor rad_cos, // [N_theta] float64
+                torch::Tensor rad_sin, // [N_theta] float64
+                double r_min, double r_max, int64_t n_r, int64_t M_limit) {
+  using C = c10::complex<double>;
+  const double PI = 3.141592653589793;
+
+  TORCH_CHECK(node_x.device().is_cpu(), "node_x must be on CPU");
+  TORCH_CHECK(node_k.scalar_type() == torch::kComplexDouble,
+              "node_k must be complex128");
+  TORCH_CHECK(node_phi_s.scalar_type() == torch::kComplexDouble,
+              "node_phi_s must be complex128");
+  TORCH_CHECK(node_phi_r.scalar_type() == torch::kComplexDouble,
+              "node_phi_r must be complex128");
+
+  int64_t n_theta = rad_cos.size(0);
+  int64_t M_max = node_k.size(1);
+  double delta_r = (r_max - r_min) / std::max(n_r - 1, (int64_t)1);
+
+  const double *nx = node_x.data_ptr<double>();
+  const double *ny = node_y.data_ptr<double>();
+  const int64_t *elt = elements.data_ptr<int64_t>();
+  const int64_t *adj = adjacency.data_ptr<int64_t>();
+  const C *nk = reinterpret_cast<const C *>(node_k.data_ptr());
+  const C *nps = reinterpret_cast<const C *>(node_phi_s.data_ptr());
+  const C *npr = reinterpret_cast<const C *>(node_phi_r.data_ptr());
+  const int64_t *nM = node_M_t.data_ptr<int64_t>();
+  const double *rc = rad_cos.data_ptr<double>();
+  const double *rs = rad_sin.data_ptr<double>();
+
+  auto P_t = torch::zeros(
+      {n_theta, n_r}, torch::dtype(torch::kComplexDouble).device(torch::kCPU));
+  C *P = reinterpret_cast<C *>(P_t.data_ptr());
+
+  // ICORNER[side] = {i1, i2, i_opp}
+  // side 0: nodes (1,2), side 1: nodes (2,0), side 2: nodes (0,1)
+  static const int ICORNER[3][3] = {{1, 2, 0}, {2, 0, 1}, {0, 1, 2}};
+
+  // Helper: compute barycentric weights for point (px,py) in element ie.
+  // Fills w[3] = {w0, w1, w2}. Returns false if degenerate.
+  auto bary_weights = [&](int64_t ie, double px, double py,
+                          double w[3]) -> bool {
+    int64_t s0 = elt[ie * 3], s1 = elt[ie * 3 + 1], s2 = elt[ie * 3 + 2];
+    double x0 = nx[s0], y0 = ny[s0];
+    double x1 = nx[s1], y1 = ny[s1];
+    double x2 = nx[s2], y2 = ny[s2];
+    // delta = (x1-x0)*(y2-y0) - (x2-x0)*(y1-y0)
+    double delta = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    if (std::abs(delta) < 1e-30)
+      return false;
+    double A0 = (x1 - px) * (y2 - py) - (x2 - px) * (y1 - py);
+    double A1 = (x2 - px) * (y0 - py) - (x0 - px) * (y2 - py);
+    double A2 = (x0 - px) * (y1 - py) - (x1 - px) * (y0 - py);
+    w[0] = A0 / delta;
+    w[1] = A1 / delta;
+    w[2] = A2 / delta;
+    return true;
+  };
+
+  // Helper: find which side the ray (from px,py in direction tsx,tsy) exits
+  // element ie. Returns (r_exit, s_exit, exit_side) where r_exit is distance
+  // along ray and s_exit is parameter along the side [0,1].
+  // Returns exit_side = -1 if no exit found.
+  auto ray_exit_elt = [&](int64_t ie, double px, double py, double tsx,
+                          double tsy, double &r_exit, double &s_exit,
+                          int &exit_side) {
+    int64_t ns[3] = {elt[ie * 3], elt[ie * 3 + 1], elt[ie * 3 + 2]};
+    double cx[3] = {nx[ns[0]], nx[ns[1]], nx[ns[2]]};
+    double cy[3] = {ny[ns[0]], ny[ns[1]], ny[ns[2]]};
+    exit_side = -1;
+    r_exit = 1e30;
+    s_exit = 0.5;
+    for (int side = 0; side < 3; ++side) {
+      int i1 = ICORNER[side][0], i2 = ICORNER[side][1];
+      double x1s = cx[i1] - px;
+      double y1s = cy[i1] - py;
+      double Tx = cx[i2] - cx[i1];
+      double Ty = cy[i2] - cy[i1];
+      double denom = tsx * Ty - tsy * Tx;
+      if (std::abs(denom) < 1e-30)
+        continue;
+      double r_cand = (x1s * Ty - y1s * Tx) / denom;
+      double s_cand = (x1s * tsy - y1s * tsx) / denom;
+      if (r_cand > 1e-10 && s_cand >= -0.01 && s_cand <= 1.01) {
+        if (r_cand < r_exit) {
+          r_exit = r_cand;
+          s_exit = std::max(0.0, std::min(1.0, s_cand));
+          exit_side = side;
+        }
+      }
+    }
+  };
+
+  // Helper: interpolate k and phi_r on triangle side at parameter s.
+  // Fills k_side[m] and phi_side[m] for m in [0, M).
+  // Returns false if M == 0.
+  auto interp_side = [&](int64_t ie, int side, double s, int64_t M, C *k_side,
+                         C *phi_side) {
+    int i1 = ICORNER[side][0], i2 = ICORNER[side][1];
+    int64_t n1 = elt[ie * 3 + i1], n2 = elt[ie * 3 + i2];
+    for (int64_t m = 0; m < M; ++m) {
+      k_side[m] = nk[n1 * M_max + m] * (1.0 - s) + nk[n2 * M_max + m] * s;
+      phi_side[m] = npr[n1 * M_max + m] * (1.0 - s) + npr[n2 * M_max + m] * s;
+    }
+  };
+
+  // Helper: interpolate k and phi at barycentric weights w[3] in element ie.
+  auto interp_bary = [&](int64_t ie, const double w[3], int64_t M, C *k_out,
+                         C *phi_s_out, C *phi_r_out) {
+    int64_t s0 = elt[ie * 3], s1 = elt[ie * 3 + 1], s2 = elt[ie * 3 + 2];
+    for (int64_t m = 0; m < M; ++m) {
+      k_out[m] = w[0] * nk[s0 * M_max + m] + w[1] * nk[s1 * M_max + m] +
+                 w[2] * nk[s2 * M_max + m];
+      phi_s_out[m] = w[0] * nps[s0 * M_max + m] + w[1] * nps[s1 * M_max + m] +
+                     w[2] * nps[s2 * M_max + m];
+      phi_r_out[m] = w[0] * npr[s0 * M_max + m] + w[1] * npr[s1 * M_max + m] +
+                     w[2] * npr[s2 * M_max + m];
+    }
+  };
+
+  // Per-theta work buffers (reused across thetas)
+  std::vector<C> k_in_buf(M_limit), phi_in_buf(M_limit);
+  std::vector<C> k_out_buf(M_limit), phi_out_buf(M_limit);
+  std::vector<C> sumk_buf(M_limit);
+  std::vector<C> k_src_buf(M_limit), phi_s_buf(M_limit), phi_r_buf(M_limit);
+  std::vector<C> cnst_buf(M_limit);
+
+  // Phase factor: exp(i*pi/4)
+  C phase_fac = std::exp(C(0.0, PI / 4.0));
+  double sqrt2pi = std::sqrt(2.0 * PI);
+
+  for (int64_t it = 0; it < n_theta; ++it) {
+    double tsx = rc[it], tsy = rs[it];
+
+    // --- Barycentric weights at source ---
+    double w_src[3];
+    if (!bary_weights(ie_src, sx, sy, w_src))
+      continue;
+
+    // Use MIN mode count across source element nodes, matching Porter's
+    // InterpolateModes which truncates to MIN(M(iSet1), M(iSet2)).
+    int64_t s0 = elt[ie_src * 3], s1 = elt[ie_src * 3 + 1],
+            s2 = elt[ie_src * 3 + 2];
+    int64_t M = std::min(std::min({nM[s0], nM[s1], nM[s2]}), M_limit);
+    if (M <= 0)
+      continue;
+
+    // Interpolate k, phi_s, phi_r at source
+    interp_bary(ie_src, w_src, M, k_src_buf.data(), phi_s_buf.data(),
+                phi_r_buf.data());
+
+    // Compute const[m] = phi_s[m] * exp(i*pi/4) * sqrt(2*pi)
+    for (int64_t m = 0; m < M; ++m)
+      cnst_buf[m] = phi_s_buf[m] * phase_fac * sqrt2pi;
+
+    // --- Find exit from source element using Porter's Inside/Outside logic ---
+    // Porter picks the FAR intercept (Outside) as the exit, not the nearest.
+    // The source is inside the element, so the nearest intercept is "Inside"
+    // (backward along the ray) and the farthest is "Outside" (forward exit).
+    double r_out = -1;
+    double s_out = 0.5;
+    int exit_side = -1;
+    {
+      double xc = (nx[elt[ie_src * 3]] + nx[elt[ie_src * 3 + 1]] +
+                   nx[elt[ie_src * 3 + 2]]) /
+                  3.0;
+      double yc = (ny[elt[ie_src * 3]] + ny[elt[ie_src * 3 + 1]] +
+                   ny[elt[ie_src * 3 + 2]]) /
+                  3.0;
+      double RV[3], SV[3], RVC[3];
+      for (int side = 0; side < 3; ++side) {
+        int i1 = ICORNER[side][0], i2 = ICORNER[side][1];
+        int64_t n1 = elt[ie_src * 3 + i1], n2 = elt[ie_src * 3 + i2];
+        double x1s = nx[n1] - sx, y1s = ny[n1] - sy;
+        double txc = nx[n1] - xc, tyc = ny[n1] - yc;
+        double Tx = nx[n2] - nx[n1], Ty = ny[n2] - ny[n1];
+        double Delta = tsx * Ty - tsy * Tx;
+        if (std::abs(Delta) < 1e-30) {
+          SV[side] = 1e30;
+          RV[side] = 0;
+          RVC[side] = 0;
+          continue;
+        }
+        RVC[side] = (txc * Ty - tyc * Tx) / Delta;
+        RV[side] = (x1s * Ty - y1s * Tx) / Delta;
+        SV[side] = (x1s * tsy - y1s * tsx) / Delta;
+      }
+      // Porter: IBad = side with s furthest from 0.5
+      int IBad = 0;
+      if (std::abs(SV[1] - 0.5) > std::abs(SV[IBad] - 0.5))
+        IBad = 1;
+      if (std::abs(SV[2] - 0.5) > std::abs(SV[IBad] - 0.5))
+        IBad = 2;
+      int IGood[2], ng = 0;
+      for (int s = 0; s < 3; ++s)
+        if (s != IBad)
+          IGood[ng++] = s;
+      int Inside, Outside;
+      if (RVC[IGood[0]] < RVC[IGood[1]]) {
+        Inside = IGood[0];
+        Outside = IGood[1];
+      } else {
+        Inside = IGood[1];
+        Outside = IGood[0];
+      }
+      exit_side = Outside;
+      s_out = std::max(0.0, std::min(1.0, SV[Outside]));
+      r_out = RV[Outside];
+    }
+    if (exit_side < 0 || r_out <= 0)
+      continue;
+
+    // k/phi at exit side (Outside) and entry side (Inside) of source element
+    // Porter: kIn at Inside intercept, kOut at Outside intercept
+    // Then const (source excitation) is interpolated between Inside and Outside
+    interp_side(ie_src, exit_side, s_out, M, k_out_buf.data(),
+                phi_out_buf.data());
+
+    // Porter also initializes kIn from the Inside intercept for phase
+    // accumulation. Since the source is inside the element, R_in = RV[Inside]
+    // (could be negative if Inside is behind the source). We use R_in = 0
+    // (source position). kIn = k at source (already in k_src_buf from
+    // barycentric interpolation)
+    for (int64_t m = 0; m < M; ++m) {
+      k_in_buf[m] = k_src_buf[m];
+      phi_in_buf[m] = phi_r_buf[m];
+    }
+
+    int64_t ie_cur = ie_src;
+    int64_t ie_prev = -1;
+    double R_in = 0.0;
+    double R_out_abs = r_out;
+    int cur_exit_side = exit_side;
+
+    // k_in, phi_in = values at source
+    for (int64_t m = 0; m < M; ++m) {
+      k_in_buf[m] = k_src_buf[m];
+      phi_in_buf[m] = phi_r_buf[m];
+      sumk_buf[m] = C(0.0);
+    }
+
+    for (int64_t ir = 0; ir < n_r; ++ir) {
+      double RM = r_min + ir * delta_r;
+      // Porter: IF (RM == 0.0) RM = MIN(1.0D0, delta_r)
+      if (RM <= 0.0)
+        RM = std::min(1.0, delta_r);
+
+      // Advance ray until current segment covers RM
+      for (int guard = 0; guard < 10000; ++guard) {
+        if (RM <= R_out_abs)
+          break;
+
+        int64_t next_ie = adj[ie_cur * 3 + cur_exit_side];
+        if (next_ie < 0) {
+          R_out_abs = 1e30;
+          break;
+        }
+
+        R_in = R_out_abs;
+        for (int64_t m = 0; m < M; ++m) {
+          k_in_buf[m] = k_out_buf[m];
+          phi_in_buf[m] = phi_out_buf[m];
+        }
+        ie_prev = ie_cur;
+        ie_cur = next_ie;
+
+        // Porter's InterpolateModes takes MIN(MProp, M(iSet1), M(iSet2)),
+        // so MProp can only shrink.  Match this by taking MIN.
+        int64_t ns0 = elt[ie_cur * 3], ns1 = elt[ie_cur * 3 + 1],
+                ns2 = elt[ie_cur * 3 + 2];
+        int64_t M_new =
+            std::min(std::min({nM[ns0], nM[ns1], nM[ns2]}), M_limit);
+        M = std::min(M, M_new);
+
+        double entry_x = sx + R_in * tsx;
+        double entry_y = sy + R_in * tsy;
+
+        // Porter's OUT subroutine: picks the side with |s - 0.5| closest to
+        // 0.5, skipping the side that leads back to the previous element.
+        // Porter does NOT require r > 0 — negative r is allowed (ray barely
+        // clips element).
+        double best_s_dist = 1e30;
+        double s_out_new = 0.5;
+        int exit_side_new = -1;
+        double r_out_new = 1e30;
+        for (int side = 0; side < 3; ++side) {
+          // Skip entry side (adjacent == previous element)
+          if (adj[ie_cur * 3 + side] == ie_prev && ie_prev >= 0)
+            continue;
+          int i1_ = ICORNER[side][0], i2_ = ICORNER[side][1];
+          int64_t n1_ = elt[ie_cur * 3 + i1_], n2_ = elt[ie_cur * 3 + i2_];
+          double x1s_ = nx[n1_] - entry_x, y1s_ = ny[n1_] - entry_y;
+          double Tx_ = nx[n2_] - nx[n1_], Ty_ = ny[n2_] - ny[n1_];
+          double den_ = tsx * Ty_ - tsy * Tx_;
+          if (std::abs(den_) < 1e-30)
+            continue;
+          double rc_ = (x1s_ * Ty_ - y1s_ * Tx_) / den_;
+          double sc_ = (x1s_ * tsy - y1s_ * tsx) / den_;
+          // Porter: pick side with |s - 0.5| closest to 0.5 (best intercept)
+          if (std::abs(sc_ - 0.5) < best_s_dist) {
+            best_s_dist = std::abs(sc_ - 0.5);
+            exit_side_new = side;
+            s_out_new = std::max(0.0, std::min(1.0, sc_));
+            r_out_new = rc_;
+          }
+        }
+        if (exit_side_new < 0) {
+          R_out_abs = 1e30;
+          break;
+        }
+
+        R_out_abs = R_in + r_out_new;
+        cur_exit_side = exit_side_new;
+        interp_side(ie_cur, cur_exit_side, s_out_new, M, k_out_buf.data(),
+                    phi_out_buf.data());
+      }
+
+      // Interpolate within current segment
+      double alpha = 0.0;
+      if (R_out_abs < 1e29) {
+        double span = R_out_abs - R_in;
+        if (span > 1e-30)
+          alpha = std::max(0.0, std::min(1.0, (RM - R_in) / span));
+      }
+
+      // Accumulate phase and compute P.
+      // Porter's Evaluate3D uses CMPLX() casts which truncate to single
+      // precision at each step. We match this to get identical phase
+      // trajectories.
+      C T(0.0);
+      for (int64_t m = 0; m < M; ++m) {
+        // Porter: kInt = CMPLX(kIn(L) + alpha * (kOut(L) - kIn(L)))
+        c10::complex<float> k_f = c10::complex<float>(
+            k_in_buf[m] + C(alpha) * (k_out_buf[m] - k_in_buf[m]));
+        c10::complex<float> phi_f = c10::complex<float>(
+            phi_in_buf[m] + C(alpha) * (phi_out_buf[m] - phi_in_buf[m]));
+        c10::complex<float> sumk_f =
+            c10::complex<float>(sumk_buf[m] + C(delta_r) * C(k_f));
+        C k_int(k_f);
+        C phi_int(phi_f);
+        sumk_buf[m] = C(sumk_f);
+
+        if (std::abs(k_int) > 1e-20) {
+          T += phi_int * cnst_buf[m] * std::exp(C(0.0, -1.0) * sumk_buf[m]) /
+               std::sqrt(k_int);
+        }
+      }
+      // Porter: P(itheta, ir) = CMPLX(T / SQRT(RM))
+      P[it * n_r + ir] = C(c10::complex<float>(T / std::sqrt(RM)));
+    }
+  }
+
+  return P_t;
+}
+
+// ---------------------------------------------------------------------------
+// FIELD3D STD backward kernel.
+// Re-execute forward logic, accumulate gradients via Wirtinger calculus.
+// ---------------------------------------------------------------------------
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+field3d_std_backward_cpp(
+    torch::Tensor grad_P, // [N_theta, N_r] complex128
+    // Same inputs as forward:
+    torch::Tensor node_x,     // [N_nodes] float64
+    torch::Tensor node_y,     // [N_nodes] float64
+    torch::Tensor elements,   // [N_elt, 3] int64
+    torch::Tensor adjacency,  // [N_elt, 3] int64
+    torch::Tensor node_k,     // [N_nodes, M_max] complex128
+    torch::Tensor node_phi_s, // [N_nodes, M_max] complex128
+    torch::Tensor node_phi_r, // [N_nodes, M_max] complex128
+    torch::Tensor node_M_t,   // [N_nodes] int64
+    double sx, double sy, int64_t ie_src,
+    torch::Tensor rad_cos, // [N_theta] float64
+    torch::Tensor rad_sin, // [N_theta] float64
+    double r_min, double r_max, int64_t n_r, int64_t M_limit) {
+  using C = c10::complex<double>;
+  const double PI = 3.141592653589793;
+
+  TORCH_CHECK(node_x.device().is_cpu(), "node_x must be on CPU");
+  TORCH_CHECK(node_k.scalar_type() == torch::kComplexDouble,
+              "node_k must be complex128");
+
+  int64_t n_theta = rad_cos.size(0);
+  int64_t M_max = node_k.size(1);
+  double delta_r = (r_max - r_min) / std::max(n_r - 1, (int64_t)1);
+
+  const double *nx = node_x.data_ptr<double>();
+  const double *ny = node_y.data_ptr<double>();
+  const int64_t *elt = elements.data_ptr<int64_t>();
+  const int64_t *adj = adjacency.data_ptr<int64_t>();
+  const C *nk = reinterpret_cast<const C *>(node_k.data_ptr());
+  const C *nps = reinterpret_cast<const C *>(node_phi_s.data_ptr());
+  const C *npr = reinterpret_cast<const C *>(node_phi_r.data_ptr());
+  const int64_t *nM = node_M_t.data_ptr<int64_t>();
+  const double *rc = rad_cos.data_ptr<double>();
+  const double *rs = rad_sin.data_ptr<double>();
+  const C *gP = reinterpret_cast<const C *>(grad_P.data_ptr());
+
+  // Output gradients
+  auto grad_k = torch::zeros_like(node_k);
+  auto grad_phi_s = torch::zeros_like(node_phi_s);
+  auto grad_phi_r = torch::zeros_like(node_phi_r);
+  C *gk = reinterpret_cast<C *>(grad_k.data_ptr());
+  C *gps = reinterpret_cast<C *>(grad_phi_s.data_ptr());
+  C *gpr = reinterpret_cast<C *>(grad_phi_r.data_ptr());
+
+  // ICORNER[side] = {i1, i2, i_opp}
+  // side 0: nodes (1,2), side 1: nodes (2,0), side 2: nodes (0,1)
+  static const int ICORNER[3][3] = {{1, 2, 0}, {2, 0, 1}, {0, 1, 2}};
+
+  // Helper: compute barycentric weights for point (px,py) in element ie.
+  auto bary_weights = [&](int64_t ie, double px, double py,
+                          double w[3]) -> bool {
+    int64_t s0 = elt[ie * 3], s1 = elt[ie * 3 + 1], s2 = elt[ie * 3 + 2];
+    double x0 = nx[s0], y0 = ny[s0];
+    double x1 = nx[s1], y1 = ny[s1];
+    double x2 = nx[s2], y2 = ny[s2];
+    double delta = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    if (std::abs(delta) < 1e-30)
+      return false;
+    double A0 = (x1 - px) * (y2 - py) - (x2 - px) * (y1 - py);
+    double A1 = (x2 - px) * (y0 - py) - (x0 - px) * (y2 - py);
+    double A2 = (x0 - px) * (y1 - py) - (x1 - px) * (y0 - py);
+    w[0] = A0 / delta;
+    w[1] = A1 / delta;
+    w[2] = A2 / delta;
+    return true;
+  };
+
+  // Helper: find which side the ray exits element ie.
+  auto ray_exit_elt = [&](int64_t ie, double px, double py, double tsx,
+                          double tsy, double &r_exit, double &s_exit,
+                          int &exit_side) {
+    int64_t ns[3] = {elt[ie * 3], elt[ie * 3 + 1], elt[ie * 3 + 2]};
+    double cx[3] = {nx[ns[0]], nx[ns[1]], nx[ns[2]]};
+    double cy[3] = {ny[ns[0]], ny[ns[1]], ny[ns[2]]};
+    exit_side = -1;
+    r_exit = 1e30;
+    s_exit = 0.5;
+    for (int side = 0; side < 3; ++side) {
+      int i1 = ICORNER[side][0], i2 = ICORNER[side][1];
+      double x1s = cx[i1] - px;
+      double y1s = cy[i1] - py;
+      double Tx = cx[i2] - cx[i1];
+      double Ty = cy[i2] - cy[i1];
+      double denom = tsx * Ty - tsy * Tx;
+      if (std::abs(denom) < 1e-30)
+        continue;
+      double r_cand = (x1s * Ty - y1s * Tx) / denom;
+      double s_cand = (x1s * tsy - y1s * tsx) / denom;
+      if (r_cand > 1e-10 && s_cand >= -0.01 && s_cand <= 1.01) {
+        if (r_cand < r_exit) {
+          r_exit = r_cand;
+          s_exit = std::max(0.0, std::min(1.0, s_cand));
+          exit_side = side;
+        }
+      }
+    }
+  };
+
+  // Helper: interpolate k and phi_r on triangle side at parameter s.
+  auto interp_side = [&](int64_t ie, int side, double s, int64_t M, C *k_side,
+                         C *phi_side) {
+    int i1 = ICORNER[side][0], i2 = ICORNER[side][1];
+    int64_t n1 = elt[ie * 3 + i1], n2 = elt[ie * 3 + i2];
+    for (int64_t m = 0; m < M; ++m) {
+      k_side[m] = nk[n1 * M_max + m] * (1.0 - s) + nk[n2 * M_max + m] * s;
+      phi_side[m] = npr[n1 * M_max + m] * (1.0 - s) + npr[n2 * M_max + m] * s;
+    }
+  };
+
+  // Helper: interpolate k and phi at barycentric weights w[3] in element ie.
+  auto interp_bary = [&](int64_t ie, const double w[3], int64_t M, C *k_out,
+                         C *phi_s_out, C *phi_r_out) {
+    int64_t s0 = elt[ie * 3], s1 = elt[ie * 3 + 1], s2 = elt[ie * 3 + 2];
+    for (int64_t m = 0; m < M; ++m) {
+      k_out[m] = w[0] * nk[s0 * M_max + m] + w[1] * nk[s1 * M_max + m] +
+                 w[2] * nk[s2 * M_max + m];
+      phi_s_out[m] = w[0] * nps[s0 * M_max + m] + w[1] * nps[s1 * M_max + m] +
+                     w[2] * nps[s2 * M_max + m];
+      phi_r_out[m] = w[0] * npr[s0 * M_max + m] + w[1] * npr[s1 * M_max + m] +
+                     w[2] * npr[s2 * M_max + m];
+    }
+  };
+
+  // Per-theta work buffers
+  std::vector<C> k_in_buf(M_limit), phi_in_buf(M_limit);
+  std::vector<C> k_out_buf(M_limit), phi_out_buf(M_limit);
+  std::vector<C> sumk_buf(M_limit);
+  std::vector<C> k_src_buf(M_limit), phi_s_buf(M_limit), phi_r_buf(M_limit);
+  std::vector<C> cnst_buf(M_limit);
+
+  // Backward buffers: accumulate gradients
+  std::vector<C> grad_k_in_buf(M_limit), grad_k_out_buf(M_limit);
+  std::vector<C> grad_phi_in_buf(M_limit), grad_phi_out_buf(M_limit);
+  std::vector<C> grad_cnst_buf(M_limit);
+  std::vector<C> grad_sumk_buf(M_limit);
+
+  // Phase factor: exp(i*pi/4)
+  C phase_fac = std::exp(C(0.0, PI / 4.0));
+  double sqrt2pi = std::sqrt(2.0 * PI);
+
+  for (int64_t it = 0; it < n_theta; ++it) {
+    double tsx = rc[it], tsy = rs[it];
+
+    // --- Barycentric weights at source ---
+    double w_src[3];
+    if (!bary_weights(ie_src, sx, sy, w_src))
+      continue;
+
+    // Use MIN mode count across source element nodes
+    int64_t s0 = elt[ie_src * 3], s1 = elt[ie_src * 3 + 1],
+            s2 = elt[ie_src * 3 + 2];
+    int64_t M = std::min(std::min({nM[s0], nM[s1], nM[s2]}), M_limit);
+    if (M <= 0)
+      continue;
+
+    // Interpolate k, phi_s, phi_r at source
+    interp_bary(ie_src, w_src, M, k_src_buf.data(), phi_s_buf.data(),
+                phi_r_buf.data());
+
+    // Compute const[m] = phi_s[m] * exp(i*pi/4) * sqrt(2*pi)
+    for (int64_t m = 0; m < M; ++m)
+      cnst_buf[m] = phi_s_buf[m] * phase_fac * sqrt2pi;
+
+    // --- Find exit from source element ---
+    double r_out = -1;
+    double s_out = 0.5;
+    int exit_side = -1;
+    {
+      double xc = (nx[elt[ie_src * 3]] + nx[elt[ie_src * 3 + 1]] +
+                   nx[elt[ie_src * 3 + 2]]) /
+                  3.0;
+      double yc = (ny[elt[ie_src * 3]] + ny[elt[ie_src * 3 + 1]] +
+                   ny[elt[ie_src * 3 + 2]]) /
+                  3.0;
+      double RV[3], SV[3], RVC[3];
+      for (int side = 0; side < 3; ++side) {
+        int i1 = ICORNER[side][0], i2 = ICORNER[side][1];
+        int64_t n1 = elt[ie_src * 3 + i1], n2 = elt[ie_src * 3 + i2];
+        double x1s = nx[n1] - sx, y1s = ny[n1] - sy;
+        double txc = nx[n1] - xc, tyc = ny[n1] - yc;
+        double Tx = nx[n2] - nx[n1], Ty = ny[n2] - ny[n1];
+        double Delta = tsx * Ty - tsy * Tx;
+        if (std::abs(Delta) < 1e-30) {
+          SV[side] = 1e30;
+          RV[side] = 0;
+          RVC[side] = 0;
+          continue;
+        }
+        RVC[side] = (txc * Ty - tyc * Tx) / Delta;
+        RV[side] = (x1s * Ty - y1s * Tx) / Delta;
+        SV[side] = (x1s * tsy - y1s * tsx) / Delta;
+      }
+      int IBad = 0;
+      if (std::abs(SV[1] - 0.5) > std::abs(SV[IBad] - 0.5))
+        IBad = 1;
+      if (std::abs(SV[2] - 0.5) > std::abs(SV[IBad] - 0.5))
+        IBad = 2;
+      int IGood[2], ng = 0;
+      for (int s = 0; s < 3; ++s)
+        if (s != IBad)
+          IGood[ng++] = s;
+      int Inside, Outside;
+      if (RVC[IGood[0]] < RVC[IGood[1]]) {
+        Inside = IGood[0];
+        Outside = IGood[1];
+      } else {
+        Inside = IGood[1];
+        Outside = IGood[0];
+      }
+      exit_side = Outside;
+      s_out = std::max(0.0, std::min(1.0, SV[Outside]));
+      r_out = RV[Outside];
+    }
+    if (exit_side < 0 || r_out <= 0)
+      continue;
+
+    // k/phi at exit side
+    interp_side(ie_src, exit_side, s_out, M, k_out_buf.data(),
+                phi_out_buf.data());
+
+    int64_t ie_cur = ie_src;
+    int64_t ie_prev = -1;
+    double R_in = 0.0;
+    double R_out_abs = r_out;
+    int cur_exit_side = exit_side;
+
+    // k_in, phi_in = values at source
+    for (int64_t m = 0; m < M; ++m) {
+      k_in_buf[m] = k_src_buf[m];
+      phi_in_buf[m] = phi_r_buf[m];
+      sumk_buf[m] = C(0.0);
+      grad_k_in_buf[m] = C(0.0);
+      grad_k_out_buf[m] = C(0.0);
+      grad_phi_in_buf[m] = C(0.0);
+      grad_phi_out_buf[m] = C(0.0);
+      grad_cnst_buf[m] = C(0.0);
+      grad_sumk_buf[m] = C(0.0);
+    }
+
+    for (int64_t ir = 0; ir < n_r; ++ir) {
+      double RM = r_min + ir * delta_r;
+      if (RM <= 0.0)
+        RM = std::min(1.0, delta_r);
+
+      // Advance ray until current segment covers RM
+      for (int guard = 0; guard < 10000; ++guard) {
+        if (RM <= R_out_abs)
+          break;
+
+        int64_t next_ie = adj[ie_cur * 3 + cur_exit_side];
+        if (next_ie < 0) {
+          R_out_abs = 1e30;
+          break;
+        }
+
+        R_in = R_out_abs;
+        for (int64_t m = 0; m < M; ++m) {
+          k_in_buf[m] = k_out_buf[m];
+          phi_in_buf[m] = phi_out_buf[m];
+        }
+        ie_prev = ie_cur;
+        ie_cur = next_ie;
+
+        int64_t ns0 = elt[ie_cur * 3], ns1 = elt[ie_cur * 3 + 1],
+                ns2 = elt[ie_cur * 3 + 2];
+        int64_t M_new =
+            std::min(std::min({nM[ns0], nM[ns1], nM[ns2]}), M_limit);
+        M = std::min(M, M_new);
+
+        double entry_x = sx + R_in * tsx;
+        double entry_y = sy + R_in * tsy;
+
+        double best_s_dist = 1e30;
+        double s_out_new = 0.5;
+        int exit_side_new = -1;
+        double r_out_new = 1e30;
+        for (int side = 0; side < 3; ++side) {
+          if (adj[ie_cur * 3 + side] == ie_prev && ie_prev >= 0)
+            continue;
+          int i1_ = ICORNER[side][0], i2_ = ICORNER[side][1];
+          int64_t n1_ = elt[ie_cur * 3 + i1_], n2_ = elt[ie_cur * 3 + i2_];
+          double x1s_ = nx[n1_] - entry_x, y1s_ = ny[n1_] - entry_y;
+          double Tx_ = nx[n2_] - nx[n1_], Ty_ = ny[n2_] - ny[n1_];
+          double den_ = tsx * Ty_ - tsy * Tx_;
+          if (std::abs(den_) < 1e-30)
+            continue;
+          double rc_ = (x1s_ * Ty_ - y1s_ * Tx_) / den_;
+          double sc_ = (x1s_ * tsy - y1s_ * tsx) / den_;
+          if (std::abs(sc_ - 0.5) < best_s_dist) {
+            best_s_dist = std::abs(sc_ - 0.5);
+            exit_side_new = side;
+            s_out_new = std::max(0.0, std::min(1.0, sc_));
+            r_out_new = rc_;
+          }
+        }
+        if (exit_side_new < 0) {
+          R_out_abs = 1e30;
+          break;
+        }
+
+        R_out_abs = R_in + r_out_new;
+        cur_exit_side = exit_side_new;
+        interp_side(ie_cur, cur_exit_side, s_out_new, M, k_out_buf.data(),
+                    phi_out_buf.data());
+      }
+
+      // Interpolate within current segment
+      double alpha = 0.0;
+      if (R_out_abs < 1e29) {
+        double span = R_out_abs - R_in;
+        if (span > 1e-30)
+          alpha = std::max(0.0, std::min(1.0, (RM - R_in) / span));
+      }
+
+      // Accumulate phase and compute gradient contribution
+      C T(0.0);
+      std::vector<C> k_int_buf(M), phi_int_buf(M);
+      std::vector<C> exp_sumk_buf(M);
+
+      for (int64_t m = 0; m < M; ++m) {
+        // Forward: kInt = CMPLX(kIn + alpha * (kOut - kIn))
+        c10::complex<float> k_f = c10::complex<float>(
+            k_in_buf[m] + C(alpha) * (k_out_buf[m] - k_in_buf[m]));
+        c10::complex<float> phi_f = c10::complex<float>(
+            phi_in_buf[m] + C(alpha) * (phi_out_buf[m] - phi_in_buf[m]));
+        c10::complex<float> sumk_f =
+            c10::complex<float>(sumk_buf[m] + C(delta_r) * C(k_f));
+        C k_int(k_f);
+        C phi_int(phi_f);
+        k_int_buf[m] = k_int;
+        phi_int_buf[m] = phi_int;
+        sumk_buf[m] = C(sumk_f);
+
+        if (std::abs(k_int) > 1e-20) {
+          C exp_neg_i_sumk = std::exp(C(0.0, -1.0) * sumk_buf[m]);
+          exp_sumk_buf[m] = exp_neg_i_sumk;
+          C contrib = phi_int * cnst_buf[m] * exp_neg_i_sumk / std::sqrt(k_int);
+          T += contrib;
+        }
+      }
+
+      // Backward: grad_P flows through P = T / sqrt(RM)
+      C gp = gP[it * n_r + ir];
+      if (std::abs(gp) < 1e-30)
+        continue;
+
+      // grad_T = grad_P / sqrt(RM) (holomorphic)
+      C grad_T = gp / std::sqrt(RM);
+
+      // Wirtinger conjugate derivative: conj(grad_T)
+      C grad_T_conj = std::conj(grad_T);
+
+      for (int64_t m = 0; m < M; ++m) {
+        C k_int = k_int_buf[m];
+        C phi_int = phi_int_buf[m];
+        if (std::abs(k_int) < 1e-20)
+          continue;
+
+        C exp_neg_i_sumk = exp_sumk_buf[m];
+        C sqrt_k_int = std::sqrt(k_int);
+        C inv_sqrt_k = C(1.0) / sqrt_k_int;
+
+        // contrib = phi_int * cnst[m] * exp(-i*sumk[m]) / sqrt(k_int)
+        C contrib = phi_int * cnst_buf[m] * exp_neg_i_sumk * inv_sqrt_k;
+
+        // Holomorphic partial derivatives (Wirtinger: ∂/∂z* = conj(∂/∂z) for
+        // holomorphic f) ∂contrib/∂phi_int = cnst * exp / sqrt(k)
+        if (std::abs(phi_int) > 1e-30) {
+          C dphi_int = cnst_buf[m] * exp_neg_i_sumk * inv_sqrt_k;
+          grad_phi_in_buf[m] +=
+              grad_T_conj * (1.0 - alpha) * std::conj(dphi_int);
+          grad_phi_out_buf[m] += grad_T_conj * alpha * std::conj(dphi_int);
+        }
+
+        // ∂contrib/∂cnst[m] = phi_int * exp / sqrt(k)
+        if (std::abs(cnst_buf[m]) > 1e-30) {
+          C dcnst = phi_int * exp_neg_i_sumk * inv_sqrt_k;
+          grad_cnst_buf[m] += grad_T_conj * std::conj(dcnst);
+        }
+
+        // ∂contrib/∂k_int via sqrt and exp
+        // d(1/sqrt(k))/dk = -1/(2*k*sqrt(k)) = -1/(2*k^1.5)
+        // d(exp(-i*sumk))/d(k_int) = 0 (sumk is independent of k at this point
+        // in phase accumulation) But wait: sumk += delta_r * k_int, so we need
+        // to chain rule through that! grad_sumk[m] gets contributions from this
+        // range point's phase Then grad_k_int gets contribution from d(sumk)
+        // w.r.t. k_int
+
+        if (std::abs(k_int) > 1e-20) {
+          // ∂contrib/∂k_int = phi_int * cnst * d(exp(-i*sumk) / sqrt(k)) /
+          // d(k_int) = phi_int * cnst * (exp(-i*sumk) * d(1/sqrt(k))/d(k_int) +
+          // 1/sqrt(k) * d(exp(-i*sumk))/d(k_int)) d(1/sqrt(k))/d(k) =
+          // -1/(2*k^1.5) d(exp(-i*sumk))/d(k_int) = d(exp(-i*sumk))/d(sumk) *
+          // d(sumk)/d(k_int)
+          //                            = -i*exp(-i*sumk) * delta_r
+          C dk_int = phi_int * cnst_buf[m] * exp_neg_i_sumk *
+                     (C(-1.0) / (C(2.0) * k_int * sqrt_k_int) +
+                      C(0.0, -1.0) * delta_r / sqrt_k_int);
+
+          // Interpolation: k_int = k_in + alpha*(k_out - k_in)
+          grad_k_in_buf[m] += grad_T_conj * (1.0 - alpha) * std::conj(dk_int);
+          grad_k_out_buf[m] += grad_T_conj * alpha * std::conj(dk_int);
+        }
+      }
+    }
+
+    // Propagate grad_phi_in, grad_k_in backward through source interpolation
+    for (int64_t m = 0; m < M; ++m) {
+      gpr[s0 * M_max + m] += grad_phi_in_buf[m] * w_src[0];
+      gpr[s1 * M_max + m] += grad_phi_in_buf[m] * w_src[1];
+      gpr[s2 * M_max + m] += grad_phi_in_buf[m] * w_src[2];
+
+      gk[s0 * M_max + m] += grad_k_in_buf[m] * w_src[0];
+      gk[s1 * M_max + m] += grad_k_in_buf[m] * w_src[1];
+      gk[s2 * M_max + m] += grad_k_in_buf[m] * w_src[2];
+    }
+
+    // Propagate grad_phi_out, grad_k_out backward through exit side
+    // interpolation These accumulate through entire ray traversal, so propagate
+    // at first exit
+    int i1 = ICORNER[exit_side][0], i2 = ICORNER[exit_side][1];
+    int64_t n1_exit = elt[ie_src * 3 + i1], n2_exit = elt[ie_src * 3 + i2];
+    for (int64_t m = 0; m < M; ++m) {
+      // Use actual s_out value computed in forward
+      double s_out_interp = s_out;
+      gpr[n1_exit * M_max + m] += grad_phi_out_buf[m] * (1.0 - s_out_interp);
+      gpr[n2_exit * M_max + m] += grad_phi_out_buf[m] * s_out_interp;
+
+      gk[n1_exit * M_max + m] += grad_k_out_buf[m] * (1.0 - s_out_interp);
+      gk[n2_exit * M_max + m] += grad_k_out_buf[m] * s_out_interp;
+    }
+
+    // Propagate grad_cnst backward to grad_phi_s
+    // cnst[m] = phi_s[m] * phase_fac * sqrt2pi
+    for (int64_t m = 0; m < M; ++m) {
+      if (std::abs(cnst_buf[m]) > 1e-30) {
+        C grad_phi_s_mode = grad_cnst_buf[m] * phase_fac * sqrt2pi;
+        gps[s0 * M_max + m] += grad_phi_s_mode * w_src[0];
+        gps[s1 * M_max + m] += grad_phi_s_mode * w_src[1];
+        gps[s2 * M_max + m] += grad_phi_s_mode * w_src[2];
+      }
+    }
+  }
+
   return std::make_tuple(grad_k, grad_phi_s, grad_phi_r);
 }
 
@@ -2907,11 +4100,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("acoustic_solve2", &acoustic_solve2);
   m.def("dispersion_complex_batch", &dispersion_complex_batch_cpp);
   m.def("dispersion_complex_scalar", &dispersion_complex_scalar_cpp);
-  m.def("tridiag_inverse_iteration_batch", &tridiag_inverse_iteration_batch_cpp);
-  m.def("fused_assembly_inverse_iteration", &fused_assembly_inverse_iteration_cpp);
+  m.def("tridiag_inverse_iteration_batch",
+        &tridiag_inverse_iteration_batch_cpp);
+  m.def("fused_assembly_inverse_iteration",
+        &fused_assembly_inverse_iteration_cpp);
   m.def("refine_roots", &refine_roots_cpp);
   m.def("elastic_solve1", &elastic_solve1_cpp);
   m.def("krakenc_fused", &krakenc_fused_cpp);
   m.def("field3d_gbt", &field3d_gbt_cpp);
   m.def("field3d_gbt_backward", &field3d_gbt_backward_cpp);
+  m.def("field3d_std", &field3d_std_cpp);
+  m.def("field3d_std_backward", &field3d_std_backward_cpp);
 }

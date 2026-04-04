@@ -46,8 +46,7 @@ class EigvecReattachFn(torch.autograd.Function):
             return None, grad_x, grad_d, grad_e
 
 
-def _backward_single(grad_phi, phi, x_star, d_vals, e_vals, reg=1e-10,
-                     phi_adj=None):
+def _backward_single(grad_phi, phi, x_star, d_vals, e_vals, reg=1e-10, phi_adj=None):
     """Solve the eigenvector adjoint system (T - x_star + reg) lambda = g_orth.
 
     Uses the Thomas algorithm (tridiag solve) with Tikhonov regularization.
@@ -739,11 +738,14 @@ class TridiagEigvecVaryingBatchAdjointFn(torch.autograd.Function):
         # residual from Richardson-extrapolated eigenvalue vs NV=1 tridiag.
         # Only when e is shared (not per-mode varying batch).
         from diff_utils.solve_tridiag import tridiag_inverse_iteration_batch
+
         if e_batch.dim() == 1:
             # Shared e — can batch the re-extraction
             with torch.no_grad():
                 phi_adj_batch = tridiag_inverse_iteration_batch(
-                    d_batch.detach(), e_batch.detach(), n_iter=10,
+                    d_batch.detach(),
+                    e_batch.detach(),
+                    n_iter=10,
                 )
                 for m2 in range(M):
                     if phi_adj_batch[m2].is_complex():
@@ -761,8 +763,13 @@ class TridiagEigvecVaryingBatchAdjointFn(torch.autograd.Function):
             e_m = e_batch[m] if e_batch.dim() == 2 else e_batch
             phi_adj_m = phi_adj_batch[m] if phi_adj_batch is not None else None
             _, _, gd, ge = _backward_single(
-                grad_phi_batch[m], phi_batch[m], sigmas[m], d_m, e_m,
-                reg=base_reg, phi_adj=phi_adj_m,
+                grad_phi_batch[m],
+                phi_batch[m],
+                sigmas[m],
+                d_m,
+                e_m,
+                reg=base_reg,
+                phi_adj=phi_adj_m,
             )
             if gd is not None:
                 grad_d_batch[m] = gd

@@ -44,7 +44,6 @@ def searchsorted_lerp(
 
 
 class _InterpBatchFn(torch.autograd.Function):
-    """Batched interpolation with compiled C++ backward for scatter."""
     @staticmethod
     def forward(values_batch, idx_lo, idx_hi, weights):
         left = values_batch[:, idx_lo]
@@ -71,7 +70,6 @@ class _InterpBatchFn(torch.autograd.Function):
 
 
 def _interp_indices(z_knots, z_query):
-    """Compute interpolation indices and weights (cacheable)."""
     N = z_knots.shape[0]
     idx_hi = torch.searchsorted(z_knots, z_query, right=False).clamp(1, N - 1)
     idx_lo = idx_hi - 1
@@ -82,7 +80,6 @@ def _interp_indices(z_knots, z_query):
     return idx_lo, idx_hi, weights
 
 
-# Cache for repeated interpolations with same grids
 _interp_cache = {}
 
 

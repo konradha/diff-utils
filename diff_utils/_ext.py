@@ -12,13 +12,11 @@ _BUILD_DIR = Path(__file__).parent / "_build"
 
 
 def _source_hash() -> str:
-    """Short hash of the C++ source for cache-busting the module name."""
     h = hashlib.md5(_SRC_PATH.read_bytes()).hexdigest()[:8]
     return h
 
 
 def _try_cached_import(name: str):
-    """Try to import an already-built extension without recompilation."""
     build_dir = _BUILD_DIR / name
     if not build_dir.exists():
         return None
@@ -46,13 +44,11 @@ def _cpu_ext():
 
     name = f"diff_utils_cpu_{_source_hash()}"
 
-    # Fast path: try loading already-compiled .so
     cached = _try_cached_import(name)
     if cached is not None:
         _CPU_EXT = cached
         return _CPU_EXT
 
-    # Slow path: compile
     backup = dict(os.environ)
     for k in list(os.environ.keys()):
         if k.startswith("CONDA_") or k in {

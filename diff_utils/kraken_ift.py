@@ -51,7 +51,6 @@ def _lorentz_inv(z: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 def _ift_forward_sweep(x_m, B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n, f_bot, g_bot):
-    """Forward recurrence through acoustic layers (single mode). Returns per-layer cache."""
     f_in = [None] * n_layers
     g_in = [None] * n_layers
     h2k2_l = [None] * n_layers
@@ -75,7 +74,12 @@ def _ift_forward_sweep(x_m, B1_c, n_layers, layer_h, layer_rho, layer_loc, layer
         p1_init = (-2.0 * g_cur).reshape(1)
         p2_init = ((B1_c[loc_end] - h2k2[0]) * g_cur - 2.0 * h * f_cur * rho).reshape(1)
         f_num, g_val, p_history = AcousticRecurrenceFn.apply(
-            B1_c, h2k2, loc, loc_end - 1, p1_init, p2_init,
+            B1_c,
+            h2k2,
+            loc,
+            loc_end - 1,
+            p1_init,
+            p2_init,
         )
         h2k2_l[li] = h2k2
         p1i_l[li] = p1_init
@@ -88,8 +92,9 @@ def _ift_forward_sweep(x_m, B1_c, n_layers, layer_h, layer_rho, layer_loc, layer
     return f_cur, g_cur, f_in, g_in, h2k2_l, p1i_l, p2i_l, ph_l
 
 
-def _ift_forward_sweep_batch(x_batch, B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n, f_bot, g_bot):
-    """Batched forward recurrence: M modes through acoustic layers in one pass per layer."""
+def _ift_forward_sweep_batch(
+    x_batch, B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n, f_bot, g_bot
+):
     M = x_batch.shape[0]
     h2k2_l = [None] * n_layers
     p1i_l = [None] * n_layers
@@ -113,7 +118,12 @@ def _ift_forward_sweep_batch(x_batch, B1_c, n_layers, layer_h, layer_rho, layer_
         p1_init = -2.0 * g_cur  # [M]
         p2_init = (B1_c[loc_end] - h2k2) * g_cur - 2.0 * h * f_cur * rho  # [M]
         f_num, g_val, p_history = AcousticRecurrenceFn.apply(
-            B1_c, h2k2, loc, loc_end - 1, p1_init, p2_init,
+            B1_c,
+            h2k2,
+            loc,
+            loc_end - 1,
+            p1_init,
+            p2_init,
         )
         h2k2_l[li] = h2k2
         p1i_l[li] = p1_init
@@ -127,15 +137,21 @@ def _ift_forward_sweep_batch(x_batch, B1_c, n_layers, layer_h, layer_rho, layer_
 
 
 def _ift_backward_sweep(
-    B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n,
-    g_in, h2k2_l, p1i_l, p2i_l, ph_l, is_complex,
-    f_top=None, g_top=None,
+    B1_c,
+    n_layers,
+    layer_h,
+    layer_rho,
+    layer_loc,
+    layer_n,
+    g_in,
+    h2k2_l,
+    p1i_l,
+    p2i_l,
+    ph_l,
+    is_complex,
+    f_top=None,
+    g_top=None,
 ):
-    """Backward recurrence through acoustic layers (single mode).
-
-    f_top, g_top: top BC values. Default (None) = vacuum (f=1, g=0 → Delta=-g).
-    Returns (grad_f_bot, grad_g_bot, dDelta_dx, grad_B1_delta).
-    """
     device = B1_c.device
     dtype = torch.complex128 if is_complex else torch.float64
     # Delta = f * g_top - g * f_top → dDelta/df = g_top, dDelta/dg = -f_top
@@ -158,12 +174,17 @@ def _ift_backward_sweep(
         grad_f_num = (grad_f_cur / (2.0 * h * rho)).reshape(1)
         grad_g_val = grad_g_cur.reshape(1)
 
-        grad_B1_layer, grad_h2k2_layer, grad_p1i_layer, grad_p2i_layer = (
-            _run_recurrence_bwd(
-                grad_f_num, grad_g_val, B1_c,
-                h2k2_l[li], ph_l[li], loc, loc_end - 1,
-                p1i_l[li], p2i_l[li], False,
-            )
+        grad_B1_layer, grad_h2k2_layer, grad_p1i_layer, grad_p2i_layer = _run_recurrence_bwd(
+            grad_f_num,
+            grad_g_val,
+            B1_c,
+            h2k2_l[li],
+            ph_l[li],
+            loc,
+            loc_end - 1,
+            p1i_l[li],
+            p2i_l[li],
+            False,
         )
 
         grad_B1_delta += grad_B1_layer
@@ -173,22 +194,25 @@ def _ift_backward_sweep(
         dDelta_dx = dDelta_dx + grad_h2k2_total * (h * h)
 
         grad_f_cur = -2.0 * h * rho * grad_p2i_layer[0]
-        grad_g_cur = (
-            -2.0 * grad_p1i_layer[0]
-            + (B1_c[loc_end] - h2k2_l[li][0]) * grad_p2i_layer[0]
-        )
+        grad_g_cur = -2.0 * grad_p1i_layer[0] + (B1_c[loc_end] - h2k2_l[li][0]) * grad_p2i_layer[0]
 
     return grad_f_cur, grad_g_cur, dDelta_dx, grad_B1_delta
 
 
 def _ift_backward_sweep_batch(
-    B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n,
-    g_in, h2k2_l, p1i_l, p2i_l, ph_l, M,
+    B1_c,
+    n_layers,
+    layer_h,
+    layer_rho,
+    layer_loc,
+    layer_n,
+    g_in,
+    h2k2_l,
+    p1i_l,
+    p2i_l,
+    ph_l,
+    M,
 ):
-    """Batched backward recurrence: M modes through acoustic layers.
-
-    Returns (grad_f_bot[M], grad_g_bot[M], dDelta_dx[M], grad_B1_delta).
-    """
     device = B1_c.device
     dtype = torch.complex128
     grad_f_cur = torch.zeros(M, dtype=dtype, device=device)
@@ -206,12 +230,17 @@ def _ift_backward_sweep_batch(
         grad_f_num = grad_f_cur / (2.0 * h * rho)  # [M]
         grad_g_val = grad_g_cur  # [M]
 
-        grad_B1_layer, grad_h2k2_layer, grad_p1i_layer, grad_p2i_layer = (
-            _run_recurrence_bwd(
-                grad_f_num, grad_g_val, B1_c,
-                h2k2_l[li], ph_l[li], loc, loc_end - 1,
-                p1i_l[li], p2i_l[li], False,
-            )
+        grad_B1_layer, grad_h2k2_layer, grad_p1i_layer, grad_p2i_layer = _run_recurrence_bwd(
+            grad_f_num,
+            grad_g_val,
+            B1_c,
+            h2k2_l[li],
+            ph_l[li],
+            loc,
+            loc_end - 1,
+            p1i_l[li],
+            p2i_l[li],
+            False,
         )
 
         grad_B1_delta += grad_B1_layer
@@ -221,10 +250,7 @@ def _ift_backward_sweep_batch(
         dDelta_dx = dDelta_dx + grad_h2k2_total * (h * h)
 
         grad_f_cur = -2.0 * h * rho * grad_p2i_layer  # [M]
-        grad_g_cur = (
-            -2.0 * grad_p1i_layer
-            + (B1_c[loc_end] - h2k2_l[li]) * grad_p2i_layer
-        )
+        grad_g_cur = -2.0 * grad_p1i_layer + (B1_c[loc_end] - h2k2_l[li]) * grad_p2i_layer
 
     return grad_f_cur, grad_g_cur, dDelta_dx, grad_B1_delta
 
@@ -425,9 +451,21 @@ def kraken_eigenvalue_ift(
     eps: float = 1e-12,
 ) -> torch.Tensor:
     return KrakenEigenvalueIFT.apply(
-        x_converged, B1, rho_med, h_med, loc_start, loc_end,
-        f_bc_top, g_bc_top, f_bc_bot, g_bc_bot,
-        dfdx_top, dgdx_top, dfdx_bot, dgdx_bot, eps,
+        x_converged,
+        B1,
+        rho_med,
+        h_med,
+        loc_start,
+        loc_end,
+        f_bc_top,
+        g_bc_top,
+        f_bc_bot,
+        g_bc_bot,
+        dfdx_top,
+        dgdx_top,
+        dfdx_bot,
+        dgdx_bot,
+        eps,
     )
 
 
@@ -948,12 +986,26 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
     @staticmethod
     def setup_context(ctx, inputs, output):
         (
-            x_converged, B1, layer_h, layer_rho, layer_loc, layer_n,
-            branch_signs, c_bot, rho_bot,
-            omega2, c_imag, dc_imag_dc, eps,
-            f_top_vals, g_top_vals,
-            c_top, rho_top, cs_bot,
-            c_imag_top, dc_imag_dc_top,
+            x_converged,
+            B1,
+            layer_h,
+            layer_rho,
+            layer_loc,
+            layer_n,
+            branch_signs,
+            c_bot,
+            rho_bot,
+            omega2,
+            c_imag,
+            dc_imag_dc,
+            eps,
+            f_top_vals,
+            g_top_vals,
+            c_top,
+            rho_top,
+            cs_bot,
+            c_imag_top,
+            dc_imag_dc_top,
         ) = inputs
         ctx.omega2 = omega2
         ctx.c_imag = c_imag
@@ -965,8 +1017,17 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
         ctx.has_c_top = c_top is not None
         ctx.has_rho_top = rho_top is not None
         ctx.has_cs_bot = cs_bot is not None
-        tensors = [x_converged, B1, layer_h, layer_rho, layer_loc, layer_n,
-                   branch_signs, c_bot, rho_bot]
+        tensors = [
+            x_converged,
+            B1,
+            layer_h,
+            layer_rho,
+            layer_loc,
+            layer_n,
+            branch_signs,
+            c_bot,
+            rho_bot,
+        ]
         if f_top_vals is not None:
             tensors.extend([f_top_vals, g_top_vals])
         if c_top is not None:
@@ -980,20 +1041,32 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_x):
         (
-            x_converged, B1, layer_h, layer_rho, layer_loc, layer_n,
-            branch_signs, c_bot, rho_bot, *rest,
+            x_converged,
+            B1,
+            layer_h,
+            layer_rho,
+            layer_loc,
+            layer_n,
+            branch_signs,
+            c_bot,
+            rho_bot,
+            *rest,
         ) = ctx.saved_tensors
         # Unpack optional saved tensors in order they were appended
         idx = 0
         f_top_vals = g_top_vals = c_top_t = rho_top_t = cs_bot_t = None
         if ctx.has_top_bc:
-            f_top_vals, g_top_vals = rest[idx], rest[idx + 1]; idx += 2
+            f_top_vals, g_top_vals = rest[idx], rest[idx + 1]
+            idx += 2
         if ctx.has_c_top:
-            c_top_t = rest[idx]; idx += 1
+            c_top_t = rest[idx]
+            idx += 1
         if ctx.has_rho_top:
-            rho_top_t = rest[idx]; idx += 1
+            rho_top_t = rest[idx]
+            idx += 1
         if ctx.has_cs_bot:
-            cs_bot_t = rest[idx]; idx += 1
+            cs_bot_t = rest[idx]
+            idx += 1
         omega2 = ctx.omega2
         c_imag = ctx.c_imag
         dc_imag_dc = ctx.dc_imag_dc
@@ -1029,24 +1102,42 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
 
         # Batched forward sweep — single C++ call per layer for all M modes
         f_at_top, g_at_top, g_in, h2k2_l, p1i_l, p2i_l, ph_l = _ift_forward_sweep_batch(
-            x_c, B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n,
-            f_bot_all, g_bot_val.expand(M),
+            x_c,
+            B1_c,
+            n_layers,
+            layer_h,
+            layer_rho,
+            layer_loc,
+            layer_n,
+            f_bot_all,
+            g_bot_val.expand(M),
         )
 
         # Per-mode backward (B1 gradient needs per-mode ift_scale)
         for m in range(M):
             g_in_m = [g[m] for g in g_in]
-            h2k2_m = [h[m:m+1] for h in h2k2_l]
-            p1i_m = [p[m:m+1] for p in p1i_l]
-            p2i_m = [p[m:m+1] for p in p2i_l]
-            ph_m = [p[m:m+1] for p in ph_l]
+            h2k2_m = [h[m : m + 1] for h in h2k2_l]
+            p1i_m = [p[m : m + 1] for p in p1i_l]
+            p2i_m = [p[m : m + 1] for p in p2i_l]
+            ph_m = [p[m : m + 1] for p in ph_l]
 
             ft_m = f_top_vals[m] if f_top_vals is not None else None
             gt_m = g_top_vals[m] if g_top_vals is not None else None
             grad_f_bot_m, grad_g_bot_m, dDelta_dx_m, grad_B1_delta = _ift_backward_sweep(
-                B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n,
-                g_in_m, h2k2_m, p1i_m, p2i_m, ph_m, True,
-                f_top=ft_m, g_top=gt_m,
+                B1_c,
+                n_layers,
+                layer_h,
+                layer_rho,
+                layer_loc,
+                layer_n,
+                g_in_m,
+                h2k2_m,
+                p1i_m,
+                p2i_m,
+                ph_m,
+                True,
+                f_top=ft_m,
+                g_top=gt_m,
             )
 
             dDelta_dx_m = dDelta_dx_m + grad_f_bot_m * dfdx_bot[m]
@@ -1069,10 +1160,12 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
                 if c_top_t is not None:
                     cp_top_c = torch.complex(
                         c_top_t.detach().to(torch.float64),
-                        torch.tensor(ctx.c_imag_top, dtype=torch.float64))
+                        torch.tensor(ctx.c_imag_top, dtype=torch.float64),
+                    )
                     dcp_dc_top = torch.complex(
                         torch.ones((), dtype=torch.float64),
-                        torch.tensor(ctx.dc_imag_dc_top, dtype=torch.float64))
+                        torch.tensor(ctx.dc_imag_dc_top, dtype=torch.float64),
+                    )
                     gamma2_top = x_c[m] - omega2 / (cp_top_c * cp_top_c)
                     f_sqrt_top = torch.sqrt(gamma2_top)
                     dfdc_top = omega2 / (cp_top_c**3 * f_sqrt_top) * dcp_dc_top
@@ -1093,7 +1186,9 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
                     rho_ad = rho_bot.detach().to(torch.complex128)
                     f_el, g_el = _elastic_bc(x_c[m], omega2, cp_ad, cs_ad, rho_ad)
                     ones = torch.ones_like(f_el)
-                    dfdcs = torch.autograd.grad(f_el, cs_ad, grad_outputs=ones, retain_graph=True)[0]
+                    dfdcs = torch.autograd.grad(f_el, cs_ad, grad_outputs=ones, retain_graph=True)[
+                        0
+                    ]
                     dgdcs = torch.autograd.grad(g_el, cs_ad, grad_outputs=ones)[0]
                 dDelta_dcs_m = grad_f_bot_m * dfdcs.detach() + grad_g_bot_m * dgdcs.detach()
 
@@ -1109,11 +1204,26 @@ class KrakencVacuumAcousticBottomIFT(torch.autograd.Function):
                 grad_cs_bot = grad_cs_bot + (ift_scale * dDelta_dcs_m).real.to(c_bot.dtype)
 
         return (
-            None, grad_B1_total, None, None, None, None, None,
-            grad_c_bot, grad_rho_bot, None, None, None, None,
-            None, None,  # f_top_vals, g_top_vals
-            grad_c_top, grad_rho_top, grad_cs_bot,
-            None, None,  # c_imag_top, dc_imag_dc_top
+            None,
+            grad_B1_total,
+            None,
+            None,
+            None,
+            None,
+            None,
+            grad_c_bot,
+            grad_rho_bot,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,  # f_top_vals, g_top_vals
+            grad_c_top,
+            grad_rho_top,
+            grad_cs_bot,
+            None,
+            None,  # c_imag_top, dc_imag_dc_top
         )
 
 
@@ -1200,9 +1310,21 @@ class KrakencVacuumElasticBottomIFT(torch.autograd.Function):
     @staticmethod
     def setup_context(ctx, inputs, output):
         (
-            x_converged, B1, layer_h, layer_rho, layer_loc, layer_n,
-            c_bot, cs_bot, rho_bot,
-            omega2, c_imag, dc_imag_dc, cs_imag, dcs_imag_dcs, eps,
+            x_converged,
+            B1,
+            layer_h,
+            layer_rho,
+            layer_loc,
+            layer_n,
+            c_bot,
+            cs_bot,
+            rho_bot,
+            omega2,
+            c_imag,
+            dc_imag_dc,
+            cs_imag,
+            dcs_imag_dcs,
+            eps,
         ) = inputs
         ctx.omega2 = omega2
         ctx.c_imag = c_imag
@@ -1211,15 +1333,29 @@ class KrakencVacuumElasticBottomIFT(torch.autograd.Function):
         ctx.dcs_imag_dcs = dcs_imag_dcs
         ctx.eps = eps
         ctx.save_for_backward(
-            x_converged, B1, layer_h, layer_rho, layer_loc, layer_n,
-            c_bot, cs_bot, rho_bot,
+            x_converged,
+            B1,
+            layer_h,
+            layer_rho,
+            layer_loc,
+            layer_n,
+            c_bot,
+            cs_bot,
+            rho_bot,
         )
 
     @staticmethod
     def backward(ctx, grad_x):
         (
-            x_converged, B1, layer_h, layer_rho, layer_loc, layer_n,
-            c_bot, cs_bot, rho_bot,
+            x_converged,
+            B1,
+            layer_h,
+            layer_rho,
+            layer_loc,
+            layer_n,
+            c_bot,
+            cs_bot,
+            rho_bot,
         ) = ctx.saved_tensors
         omega2 = ctx.omega2
         eps = ctx.eps
@@ -1285,17 +1421,36 @@ class KrakencVacuumElasticBottomIFT(torch.autograd.Function):
                 dgdcs_bot = dgdcs * dcs_dcs
 
                 # df/drho, dg/drho (f doesn't depend on rho, so allow_unused)
-                dfdrho_t = torch.autograd.grad(f_bot, rho_ad, grad_outputs=ones, retain_graph=True, allow_unused=True)[0]
+                dfdrho_t = torch.autograd.grad(
+                    f_bot, rho_ad, grad_outputs=ones, retain_graph=True, allow_unused=True
+                )[0]
                 dfdrho = dfdrho_t if dfdrho_t is not None else torch.zeros_like(rho_ad)
                 dgdrho = torch.autograd.grad(g_bot, rho_ad, grad_outputs=ones)[0]
 
             _, _, f_in, g_in, h2k2_l, p1i_l, p2i_l, ph_l = _ift_forward_sweep(
-                x_m, B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n,
-                f_bot.detach(), g_bot.detach(),
+                x_m,
+                B1_c,
+                n_layers,
+                layer_h,
+                layer_rho,
+                layer_loc,
+                layer_n,
+                f_bot.detach(),
+                g_bot.detach(),
             )
             grad_f_bot, grad_g_bot, dDelta_dx, grad_B1_delta = _ift_backward_sweep(
-                B1_c, n_layers, layer_h, layer_rho, layer_loc, layer_n,
-                g_in, h2k2_l, p1i_l, p2i_l, ph_l, True,
+                B1_c,
+                n_layers,
+                layer_h,
+                layer_rho,
+                layer_loc,
+                layer_n,
+                g_in,
+                h2k2_l,
+                p1i_l,
+                p2i_l,
+                ph_l,
+                True,
             )
 
             # Add BC derivatives: dDelta/dx from BC
@@ -1313,26 +1468,58 @@ class KrakencVacuumElasticBottomIFT(torch.autograd.Function):
             grad_rho_bot = grad_rho_bot + (ift_scale * dDelta_drho).real.to(rho_bot.dtype)
 
         return (
-            None,       # x_converged
+            None,  # x_converged
             grad_B1_total,
-            None, None, None, None,  # layer_h, layer_rho, layer_loc, layer_n
+            None,
+            None,
+            None,
+            None,  # layer_h, layer_rho, layer_loc, layer_n
             grad_c_bot,
             grad_cs_bot,
             grad_rho_bot,
-            None, None, None, None, None, None,  # omega2, c_imag, dc_imag_dc, cs_imag, dcs_imag_dcs, eps
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,  # omega2, c_imag, dc_imag_dc, cs_imag, dcs_imag_dcs, eps
         )
 
 
 def krakenc_vacuum_elastic_bottom_ift(
-    x_converged, B1, layer_h, layer_rho, layer_loc, layer_n,
-    c_bot, cs_bot, rho_bot, omega2,
-    c_imag, dc_imag_dc, cs_imag, dcs_imag_dcs,
-    *, eps=1e-12,
+    x_converged,
+    B1,
+    layer_h,
+    layer_rho,
+    layer_loc,
+    layer_n,
+    c_bot,
+    cs_bot,
+    rho_bot,
+    omega2,
+    c_imag,
+    dc_imag_dc,
+    cs_imag,
+    dcs_imag_dcs,
+    *,
+    eps=1e-12,
 ):
     return KrakencVacuumElasticBottomIFT.apply(
-        x_converged, B1, layer_h, layer_rho, layer_loc, layer_n,
-        c_bot, cs_bot, rho_bot, omega2,
-        c_imag, dc_imag_dc, cs_imag, dcs_imag_dcs, eps,
+        x_converged,
+        B1,
+        layer_h,
+        layer_rho,
+        layer_loc,
+        layer_n,
+        c_bot,
+        cs_bot,
+        rho_bot,
+        omega2,
+        c_imag,
+        dc_imag_dc,
+        cs_imag,
+        dcs_imag_dcs,
+        eps,
     )
 
 

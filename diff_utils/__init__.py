@@ -23,9 +23,7 @@ from .solve_tridiag import (
 from .interp import SearchsortedLerpFn, searchsorted_lerp, interp_batch
 from .trapezoidal_dot import (
     TrapezoidalMultiLayerNormFn,
-    TrapezoidalNormFn,
     trapezoidal_multilayer_normalization,
-    trapezoidal_normalization,
 )
 from .eigenvalue_ift import eigenvalue_ift
 from .eigvec_adjoint import (
@@ -50,7 +48,6 @@ from .kraken_ift import (
 from .tridiag_eigh import tridiag_eigh
 from .mode_coupling import mode_coupling
 from .range_stepper import range_stepper, range_stepper_batched
-from .weighted_depth_integral import weighted_depth_integral, weighted_depth_inner_product
 
 __all__ = [
     "BandedLogDet",
@@ -78,9 +75,7 @@ __all__ = [
     "searchsorted_lerp",
     "interp_batch",
     "TrapezoidalMultiLayerNormFn",
-    "TrapezoidalNormFn",
     "trapezoidal_multilayer_normalization",
-    "trapezoidal_normalization",
     "eigenvalue_ift",
     "EigvecReattachFn",
     "eigvec_reattach",
@@ -102,6 +97,4 @@ __all__ = [
     "mode_coupling",
     "range_stepper",
     "range_stepper_batched",
-    "weighted_depth_integral",
-    "weighted_depth_inner_product",
 ]

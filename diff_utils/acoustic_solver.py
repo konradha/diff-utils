@@ -2,7 +2,6 @@ import torch
 
 from diff_utils._ext import _cpu_ext
 
-# BC type constants just like at/ fortran code
 BC_VACUUM = 0
 BC_RIGID = 1
 BC_ACOUSTIC = 2
