@@ -758,7 +758,15 @@ class TridiagEigvecVaryingBatchAdjointFn(torch.autograd.Function):
             phi_adj_batch = None  # per-mode e: skip re-extraction, use phi directly
 
         base_reg = max(ctx.eps * ctx.eps, 1e-10)
+        d_means = d_batch.mean(dim=1)
+        d_cluster_key = d_means.real if d_means.is_complex() else d_means
+        clusters = _find_clusters(d_cluster_key, ctx.tau)
+        in_cluster = set()
+        for cl in clusters:
+            in_cluster.update(cl)
         for m in range(M):
+            if m in in_cluster:
+                continue
             d_m = d_batch[m]
             e_m = e_batch[m] if e_batch.dim() == 2 else e_batch
             phi_adj_m = phi_adj_batch[m] if phi_adj_batch is not None else None
@@ -778,6 +786,22 @@ class TridiagEigvecVaryingBatchAdjointFn(torch.autograd.Function):
                     grad_e_batch[m] = ge
                 else:
                     grad_e_batch += ge.unsqueeze(0) if ge.dim() == 1 else ge
+
+        for cluster_indices in clusters:
+            idx = torch.tensor(cluster_indices, dtype=torch.long, device=phi_batch.device)
+            d_shared = d_batch[cluster_indices[0]]
+            e_shared = e_batch[cluster_indices[0]] if e_batch.dim() == 2 else e_batch
+            phi_cl = phi_adj_batch[idx] if phi_adj_batch is not None else phi_batch[idx]
+            gd_cl, ge_cl = tridiag_eigvec_cluster_adjoint(
+                phi_cl, d_shared, e_shared, grad_phi_batch[idx], eps=ctx.eps,
+            )
+            for ci in cluster_indices:
+                grad_d_batch[ci] += gd_cl
+            if e_batch.dim() == 2:
+                for ci in cluster_indices:
+                    grad_e_batch[ci] += ge_cl
+            else:
+                grad_e_batch += ge_cl.unsqueeze(0) if ge_cl.dim() == 1 else ge_cl
 
         return None, grad_d_batch, grad_e_batch, None, None, None
 
